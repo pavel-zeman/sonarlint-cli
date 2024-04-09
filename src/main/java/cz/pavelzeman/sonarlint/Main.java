@@ -16,8 +16,8 @@ import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Properties;
+import java.util.Set;
 import java.util.concurrent.ExecutionException;
-import org.sonar.api.batch.fs.InputFile;
 import org.sonarsource.sonarlint.core.ConnectedSonarLintEngineImpl;
 import org.sonarsource.sonarlint.core.analysis.api.ClientInputFile;
 import org.sonarsource.sonarlint.core.client.api.common.analysis.Issue;
@@ -140,7 +140,7 @@ public class Main {
     var httpClientProvider = new HttpClientProvider("sonarlint-cli", null, null, null, null);
     var endpointParams = new EndpointParams(configuration.getHost(), false, null);
     var httpClient = httpClientProvider.getHttpClientWithPreemptiveAuth(configuration.getToken(), null);
-    //engine.sync(endpointParams, httpClient, Set.of(configuration.getProjectKey()), null);
+    engine.sync(endpointParams, httpClient, Set.of(configuration.getProjectKey()), null);
   }
 
   private void getInputFiles() throws IOException {
@@ -214,7 +214,7 @@ public class Main {
       // System.out.println("</violation>");
     }
     // System.out.println("</file>");
-    System.out.println("Analysis finished");
+    // System.out.println("Analysis finished");
   }
 
   private void stopEngine() {
@@ -223,7 +223,7 @@ public class Main {
 
   private void run(String[] args) throws IOException, ExecutionException, InterruptedException {
     if (args.length != 1) {
-      System.err.println("Usage: java -jar sonarlint-cli.jar <path to sonar-project.properties>");
+      System.err.println("Usage: java -jar sonarlint-cli.jar <path to sonar-project.properties>"); 
       System.exit(1);
     }
     parseConfiguration(args[0]);
