@@ -67,6 +67,8 @@ public class Main {
 
   public static void main(String[] args) throws IOException, ExecutionException, InterruptedException {
     new Main().run(args);
+    // The engine sometimes keeps running, so we have to explicitly exit here
+    System.exit(0);
   }
 
   private String getProperty(Properties properties, String property) {
@@ -131,6 +133,12 @@ public class Main {
     var nodeVersion = getNodeVersion(nodePath);
     var sonarConfiguration = ConnectedGlobalConfiguration.sonarQubeBuilder()
         .addEnabledLanguages(Language.JS)
+        .addEnabledLanguages(Language.CSS)
+        .addEnabledLanguages(Language.HTML)
+        .addEnabledLanguages(Language.JAVA)
+        .addEnabledLanguages(Language.XML)
+        .addEnabledLanguages(Language.YAML)
+        .addEnabledLanguages(Language.JSON)
         .setConnectionId("sonarlint-cli")
         .setStorageRoot(getStorageRoot())
         .setNodeJs(Path.of(nodePath), Version.create(nodeVersion))
