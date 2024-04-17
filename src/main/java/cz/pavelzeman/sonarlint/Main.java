@@ -1,8 +1,7 @@
 package cz.pavelzeman.sonarlint;
 
-import static org.sonarsource.sonarlint.core.commons.log.ClientLogOutput.Level.INFO;
-
 import java.io.BufferedReader;
+import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -18,6 +17,9 @@ import java.util.List;
 import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.slf4j.event.Level;
 import org.sonarsource.sonarlint.core.ConnectedSonarLintEngineImpl;
 import org.sonarsource.sonarlint.core.analysis.api.ClientInputFile;
 import org.sonarsource.sonarlint.core.client.api.common.analysis.Issue;
@@ -26,10 +28,15 @@ import org.sonarsource.sonarlint.core.client.api.connected.ConnectedGlobalConfig
 import org.sonarsource.sonarlint.core.commons.IssueSeverity;
 import org.sonarsource.sonarlint.core.commons.Language;
 import org.sonarsource.sonarlint.core.commons.Version;
+import org.sonarsource.sonarlint.core.commons.log.ClientLogOutput;
 import org.sonarsource.sonarlint.core.http.HttpClientProvider;
 import org.sonarsource.sonarlint.core.serverapi.EndpointParams;
+import org.sonarsource.sonarlint.shaded.org.springframework.util.AntPathMatcher;
+import org.sonarsource.sonarlint.shaded.org.springframework.util.StringUtils;
 
 public class Main {
+
+  private static final Logger logger = LoggerFactory.getLogger(Main.class);
 
   private Configuration configuration;
   private ConnectedSonarLintEngineImpl engine;
@@ -47,22 +54,36 @@ public class Main {
       case INFO:
         return "WEAK WARNING";
       default:
-        throw new RuntimeException("Unexpected severity - " + severity);
+        throw new SonarLintException("Unexpected severity - " + severity);
     }
   }
 
-  private static void listFiles(Path path, List<ClientInputFile> clientInputFiles) throws IOException {
-    Files.list(path).forEach(file -> {
-      if (Files.isDirectory(file)) {
-        try {
-          listFiles(file, clientInputFiles);
-        } catch (IOException e) {
-          throw new RuntimeException(e);
+  private boolean isExcluded(Path file) {
+    if (configuration.getExclusions() != null) {
+      AntPathMatcher matcher = new AntPathMatcher(File.separator);
+      for (String exclusion : configuration.getExclusions()) {
+        if (matcher.match(exclusion, file.toString())) {
+          return true;
         }
-      } else {
-        clientInputFiles.add(new InputFile(file));
       }
-    });
+    }
+    return false;
+  }
+
+  private void listFiles(Path path) throws IOException {
+    try (var stream = Files.list(path)) {
+      stream.forEach(file -> {
+        if (Files.isDirectory(file)) {
+          try {
+            listFiles(file);
+          } catch (IOException e) {
+            throw new SonarLintException(e);
+          }
+        } else if (!isExcluded(file)) {
+          inputFiles.add(new InputFile(file));
+        }
+      });
+    }
   }
 
   public static void main(String[] args) throws IOException, ExecutionException, InterruptedException {
@@ -76,7 +97,11 @@ public class Main {
   }
 
   private String[] parseSources(String sources) {
-    return Arrays.stream(sources.split(",")).map(String::trim).toArray(String[]::new);
+    return sources == null ? null : Arrays.stream(sources.split(",")).map(String::trim).toArray(String[]::new);
+  }
+
+  private String[] parseExclusions(String exclusions) {
+    return exclusions == null ? null : Arrays.stream(exclusions.split(",")).map(String::trim).map(string -> string.replace("/", File.separator)).toArray(String[]::new);
   }
 
   private void parseConfiguration(String path) throws IOException {
@@ -89,7 +114,8 @@ public class Main {
         getProperty(properties, Configuration.Properties.TOKEN),
         getProperty(properties, Configuration.Properties.PROJECT_KEY),
         parseSources(getProperty(properties, Configuration.Properties.SOURCES)),
-        getProperty(properties, Configuration.Properties.PROJECT_BASE_DIR)
+        getProperty(properties, Configuration.Properties.PROJECT_BASE_DIR),
+        parseExclusions(getProperty(properties, Configuration.Properties.EXCLUSIONS))
     );
   }
 
@@ -121,7 +147,7 @@ public class Main {
     } else if (os.contains("nix") || os.contains("nux") || os.contains("mac")) {
       executable = "which";
     } else {
-      throw new RuntimeException("Unsupported OS: " + os);
+      throw new SonarLintException("Unsupported OS: " + os);
     }
     Process process = new ProcessBuilder(executable, "node").start();
     BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
@@ -129,9 +155,7 @@ public class Main {
   }
 
   private void createEngine() throws IOException {
-    var nodePath = getNodePath();
-    var nodeVersion = getNodeVersion(nodePath);
-    var sonarConfiguration = ConnectedGlobalConfiguration.sonarQubeBuilder()
+    var builder = ConnectedGlobalConfiguration.sonarQubeBuilder()
         .addEnabledLanguages(Language.JS)
         .addEnabledLanguages(Language.CSS)
         .addEnabledLanguages(Language.HTML)
@@ -140,9 +164,17 @@ public class Main {
         .addEnabledLanguages(Language.YAML)
         .addEnabledLanguages(Language.JSON)
         .setConnectionId("sonarlint-cli")
-        .setStorageRoot(getStorageRoot())
-        .setNodeJs(Path.of(nodePath), Version.create(nodeVersion))
-        .build();
+        .setStorageRoot(getStorageRoot());
+
+    var nodePath = getNodePath();
+    if (StringUtils.hasText(nodePath)) {
+      var nodeVersion = getNodeVersion(nodePath);
+      builder.setNodeJs(Path.of(nodePath), Version.create(nodeVersion));
+    } else {
+      logger.warn("No Node.js found in path, some inspections may be skipped");
+    }
+
+    var sonarConfiguration = builder.build();
 
     engine = new ConnectedSonarLintEngineImpl(sonarConfiguration);
     var httpClientProvider = new HttpClientProvider("sonarlint-cli", null, null, null, null);
@@ -152,11 +184,20 @@ public class Main {
   }
 
   private void getInputFiles() throws IOException {
-    List<ClientInputFile> inputFiles = new ArrayList<>();
+    inputFiles = new ArrayList<>();
     for (String sourcePath : configuration.getSources()) {
-      listFiles(Path.of(sourcePath), inputFiles);
+      listFiles(Path.of(sourcePath));
     }
-    this.inputFiles = inputFiles;
+  }
+
+  private Level transformLevelToSlf4j(ClientLogOutput.Level level) {
+    switch (level) {
+      case ERROR: return Level.ERROR;
+      case WARN:return Level.WARN;
+      case INFO:return Level.INFO;
+      case DEBUG:return Level.DEBUG;
+      default: return Level.TRACE;
+    }
   }
 
   private void analyze() {
@@ -167,13 +208,12 @@ public class Main {
 
     issueList = new ArrayList<>();
 
-    engine.analyze(builder.build(), issue -> {
-      issueList.add(issue);
-    }, (s, level) -> {
-      if (level.ordinal() <= INFO.ordinal()) {
-        System.out.println("Log: " + level + ": " + s);
-      }
-    }, null);
+    engine.analyze(
+        builder.build(),
+        issue -> issueList.add(issue),
+        (s, level) -> logger.atLevel(transformLevelToSlf4j(level)).log(s),
+        null
+    );
   }
 
   public String escapeStringForTc(String input) {
@@ -185,24 +225,18 @@ public class Main {
     input = input.replace("]", "|]");
     return input;
   }
+
+  @SuppressWarnings("java:S106") // System.out is fine here, because it is the way to communicate with TC
   private void reportResults() throws ExecutionException, InterruptedException {
-    String lastFile = null;
     var ruleSet = new HashSet<String>();
     for (Issue issue : issueList) {
-      if (!issue.getInputFile().relativePath().equals(lastFile)) {
-        if (lastFile != null) {
-          // System.out.println("</file>");
-        }
-        lastFile = issue.getInputFile().relativePath();
-        // System.out.println("<file name=\"" + issue.getInputFile().relativePath() + "\">");
-      }
       var ruleDetails = engine.getActiveRuleDetails(null, null, issue.getRuleKey(), null).get();
       var ruleKey = issue.getRuleKey();
       if (!ruleSet.contains(ruleKey)) {
         ruleSet.add(ruleKey);
         System.out.printf("##teamcity[inspectionType id='%s' name='%s' description='%s' category='%s']%n",
             ruleKey,
-            escapeStringForTc(ruleDetails.getName()),
+            escapeStringForTc(ruleKey + " - " + ruleDetails.getName()),
             escapeStringForTc(ruleDetails.getHtmlDescription()),
             ruleDetails.getType().name()
             );
@@ -210,28 +244,21 @@ public class Main {
       System.out.printf("##teamcity[inspection typeId='%s' message='%s' file='%s' line='%d' severity='%s']%n",
           ruleKey,
           escapeStringForTc(issue.getMessage()),
-          lastFile,
+          issue.getInputFile().relativePath(),
           issue.getStartLine(),
           getSeverity(issue.getSeverity())
       );
-      // System.out.printf(
-      //     "<violation beginline=\"%d\" endline=\"%d\" begincolumn=\"%d\" endcolumn=\"%d\" rule=\"%s\" ruleset=\"%s\" priority=\"%d\" externalInfoUrl=\"https://rules.sonarsource.com/java/RSPEC-2789\">%n",
-      //     issue.getStartLine(), issue.getEndLine(), issue.getStartLineOffset(), issue.getEndLineOffset(), issue.getRuleKey(), ruleDetails.getLanguage().toString().toLowerCase(),
-      //     getPriority(issue.getSeverity()));
-      // System.out.println(issue.getMessage());
-      // System.out.println("</violation>");
     }
-    // System.out.println("</file>");
-    // System.out.println("Analysis finished");
   }
 
   private void stopEngine() {
     engine.stop(false);
   }
 
+  @SuppressWarnings("java:S106") // System.err is used to print usage information
   private void run(String[] args) throws IOException, ExecutionException, InterruptedException {
     if (args.length != 1) {
-      System.err.println("Usage: java -jar sonarlint-cli.jar <path to sonar-project.properties>"); 
+      System.err.println("Usage: java -jar sonarlint-cli.jar <path to sonar-project.properties>");
       System.exit(1);
     }
     parseConfiguration(args[0]);
