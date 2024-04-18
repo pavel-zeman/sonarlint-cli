@@ -245,7 +245,7 @@ public class Main {
           ruleKey,
           escapeStringForTc(issue.getMessage()),
           issue.getInputFile().relativePath(),
-          issue.getStartLine(),
+          issue.getStartLine() == null ? 0 : issue.getStartLine(),
           getSeverity(issue.getSeverity())
       );
     }
