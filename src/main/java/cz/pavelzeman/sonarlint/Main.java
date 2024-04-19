@@ -14,6 +14,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
@@ -157,6 +158,7 @@ public class Main {
   private void createEngine() throws IOException {
     var builder = ConnectedGlobalConfiguration.sonarQubeBuilder()
         .addEnabledLanguages(Language.JS)
+        .addEnabledLanguages(Language.TS)
         .addEnabledLanguages(Language.CSS)
         .addEnabledLanguages(Language.HTML)
         .addEnabledLanguages(Language.JAVA)
@@ -164,7 +166,9 @@ public class Main {
         .addEnabledLanguages(Language.YAML)
         .addEnabledLanguages(Language.JSON)
         .setConnectionId("sonarlint-cli")
-        .setStorageRoot(getStorageRoot());
+        .setStorageRoot(getStorageRoot())
+        // Use huge number here, because Sonar counts files in node_modules as well and if the file count is too high, advanced JS analysis based on TS is disabled
+        .setExtraProperties(Map.of("sonar.javascript.sonarlint.typechecking.maxfiles", "10000000"));
 
     var nodePath = getNodePath();
     if (StringUtils.hasText(nodePath)) {
