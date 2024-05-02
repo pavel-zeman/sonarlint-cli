@@ -4,14 +4,12 @@
 
   <groupId>cz.pavel</groupId>
   <artifactId>sonarlint-cli</artifactId>
-  <version>0.0</version>
+  <version>0.0.1</version>
   <packaging>jar</packaging>
   <name>SonarLint CLI</name>
 
 
   <properties>
-    <!-- Release: enable publication to Bintray -->
-    <artifactsToPublish>${project.groupId}:${project.artifactId}:zip</artifactsToPublish>
     <maven.compiler.target>11</maven.compiler.target>
     <maven.compiler.source>11</maven.compiler.source>
   </properties>

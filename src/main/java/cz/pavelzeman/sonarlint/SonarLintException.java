@@ -1,7 +1,7 @@
 package cz.pavelzeman.sonarlint;
 
 /**
- * Customm exception not to use default {@link RuntimeException}.
+ * Custom exception not to use default {@link RuntimeException}.
  */
 public class SonarLintException extends RuntimeException {
 
@@ -9,7 +9,7 @@ public class SonarLintException extends RuntimeException {
     super(message);
   }
 
-  public SonarLintException(Throwable cause) {
-    super(cause);
+  public SonarLintException(String message, Throwable cause) {
+    super(message, cause);
   }
 }

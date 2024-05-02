@@ -1,11 +1,6 @@
 package cz.pavelzeman.sonarlint;
 
-import java.io.BufferedReader;
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.InputStreamReader;
+import java.io.*;
 import java.net.URI;
 import java.nio.charset.Charset;
 import java.nio.file.Files;
@@ -26,6 +21,7 @@ import org.sonarsource.sonarlint.core.analysis.api.ClientInputFile;
 import org.sonarsource.sonarlint.core.client.api.common.analysis.Issue;
 import org.sonarsource.sonarlint.core.client.api.connected.ConnectedAnalysisConfiguration;
 import org.sonarsource.sonarlint.core.client.api.connected.ConnectedGlobalConfiguration;
+import org.sonarsource.sonarlint.core.client.api.connected.ConnectedRuleDetails;
 import org.sonarsource.sonarlint.core.commons.IssueSeverity;
 import org.sonarsource.sonarlint.core.commons.Language;
 import org.sonarsource.sonarlint.core.commons.Version;
@@ -35,13 +31,31 @@ import org.sonarsource.sonarlint.core.serverapi.EndpointParams;
 import org.sonarsource.sonarlint.shaded.org.springframework.util.AntPathMatcher;
 import org.sonarsource.sonarlint.shaded.org.springframework.util.StringUtils;
 
+/**
+ * Main sonarlint class.
+ */
 public class Main {
 
   private static final Logger logger = LoggerFactory.getLogger(Main.class);
 
+  /**
+   * Configuration read from input properties file.
+   */
   private Configuration configuration;
+
+  /**
+   * Sonarlint engine.
+   */
   private ConnectedSonarLintEngineImpl engine;
+
+  /**
+   * List of all files to be analyzed.
+   */
   private List<ClientInputFile> inputFiles;
+
+  /**
+   * List of all identified issues.
+   */
   private List<Issue> issueList;
 
   private static String getSeverity(IssueSeverity severity) {
@@ -71,25 +85,23 @@ public class Main {
     return false;
   }
 
-  private void listFiles(Path path) throws IOException {
+  private void listFiles(Path path) {
     try (var stream = Files.list(path)) {
       stream.forEach(file -> {
         if (Files.isDirectory(file)) {
-          try {
-            listFiles(file);
-          } catch (IOException e) {
-            throw new SonarLintException(e);
-          }
+          listFiles(file);
         } else if (!isExcluded(file)) {
           inputFiles.add(new InputFile(file));
         }
       });
+    } catch (IOException e) {
+      throw new SonarLintException("Error when getting list of files to analyze", e);
     }
   }
 
-  public static void main(String[] args) throws IOException, ExecutionException, InterruptedException {
+  public static void main(String[] args) {
     new Main().run(args);
-    // The engine sometimes keeps running, so we have to explicitly exit here
+    // The engine sometimes keeps running in a separate thread, so we have to force exit here
     System.exit(0);
   }
 
@@ -105,10 +117,17 @@ public class Main {
     return exclusions == null ? null : Arrays.stream(exclusions.split(",")).map(String::trim).map(string -> string.replace("/", File.separator)).toArray(String[]::new);
   }
 
-  private void parseConfiguration(String path) throws IOException {
+  /**
+   * Reads configuration from given file.
+   *
+   * @param file file to read configuration from
+   */
+  private void parseConfiguration(String file) {
     var properties = new Properties();
-    try (var inputStream = new FileInputStream(path)) {
+    try (var inputStream = new FileInputStream(file)) {
       properties.load(inputStream);
+    } catch (IOException e) {
+        throw new SonarLintException("Error when reading configuration file", e);
     }
     configuration = new Configuration(
         getProperty(properties, Configuration.Properties.HOST),
@@ -125,23 +144,27 @@ public class Main {
     return Path.of(home, ".sonarlint-cli");
   }
 
-  private String getNodeVersion(String nodePath) throws IOException {
-    var process = new ProcessBuilder(nodePath, "--version").start();
-    var reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
-    var output = new StringBuilder();
-    String line;
-    while ((line = reader.readLine()) != null) {
-      output.append(line).append("\n");
+  private String getNodeVersion(String nodePath) {
+    try {
+      var process = new ProcessBuilder(nodePath, "--version").start();
+      var reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
+      var output = new StringBuilder();
+      String line;
+      while ((line = reader.readLine()) != null) {
+        output.append(line).append("\n");
+      }
+      var version = output.toString().trim();
+      if (version.startsWith("v")) {
+        version = version.substring(1);
+      }
+      return version;
+    } catch (IOException e) {
+      throw new SonarLintException("Error when getting Node.js version", e);
     }
-    var version = output.toString().trim();
-    if (version.startsWith("v")) {
-      version = version.substring(1);
-    }
-    return version;
   }
 
-  private String getNodePath() throws IOException {
-    String os = System.getProperty("os.name").toLowerCase();
+  private String getNodePath() {
+    var os = System.getProperty("os.name").toLowerCase();
     String executable;
     if (os.contains("win")) {
       executable = "where";
@@ -150,12 +173,16 @@ public class Main {
     } else {
       throw new SonarLintException("Unsupported OS: " + os);
     }
-    Process process = new ProcessBuilder(executable, "node").start();
-    BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
-    return reader.readLine();
+    try {
+      var process = new ProcessBuilder(executable, "node").start();
+      BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
+      return reader.readLine();
+    } catch (IOException e) {
+      throw new SonarLintException("Error when getting Node.js executable path", e);
+    }
   }
 
-  private void createEngine() throws IOException {
+  private void createEngine() {
     var builder = ConnectedGlobalConfiguration.sonarQubeBuilder()
         .addEnabledLanguages(Language.JS)
         .addEnabledLanguages(Language.TS)
@@ -187,7 +214,7 @@ public class Main {
     engine.sync(endpointParams, httpClient, Set.of(configuration.getProjectKey()), null);
   }
 
-  private void getInputFiles() throws IOException {
+  private void getInputFiles() {
     inputFiles = new ArrayList<>();
     for (String sourcePath : configuration.getSources()) {
       listFiles(Path.of(sourcePath));
@@ -231,10 +258,16 @@ public class Main {
   }
 
   @SuppressWarnings("java:S106") // System.out is fine here, because it is the way to communicate with TC
-  private void reportResults() throws ExecutionException, InterruptedException {
+  private void reportResults() {
     var ruleSet = new HashSet<String>();
     for (Issue issue : issueList) {
-      var ruleDetails = engine.getActiveRuleDetails(null, null, issue.getRuleKey(), null).get();
+      ConnectedRuleDetails ruleDetails;
+      try {
+        ruleDetails = engine.getActiveRuleDetails(null, null, issue.getRuleKey(), null).get();
+      } catch (InterruptedException | ExecutionException e) {
+        Thread.currentThread().interrupt();
+        throw new SonarLintException("Error when getting rule details", e);
+      }
       var ruleKey = issue.getRuleKey();
       if (!ruleSet.contains(ruleKey)) {
         ruleSet.add(ruleKey);
@@ -245,6 +278,7 @@ public class Main {
             ruleDetails.getType().name()
             );
       }
+      //noinspection DataFlowIssue issue.getInputFile() should not be null here
       System.out.printf("##teamcity[inspection typeId='%s' message='%s' file='%s' line='%d' severity='%s']%n",
           ruleKey,
           escapeStringForTc(issue.getMessage()),
@@ -260,7 +294,7 @@ public class Main {
   }
 
   @SuppressWarnings("java:S106") // System.err is used to print usage information
-  private void run(String[] args) throws IOException, ExecutionException, InterruptedException {
+  private void run(String[] args) {
     if (args.length != 1) {
       System.err.println("Usage: java -jar sonarlint-cli.jar <path to sonar-project.properties>");
       System.exit(1);
