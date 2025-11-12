@@ -1,0 +1,317 @@
+package cz.pavelzeman.sonarlint;
+
+import java.net.URI;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.slf4j.event.Level;
+import org.sonarsource.sonarlint.core.rpc.protocol.SonarLintRpcClient;
+import org.sonarsource.sonarlint.core.rpc.protocol.client.OpenUrlInBrowserParams;
+import org.sonarsource.sonarlint.core.rpc.protocol.client.analysis.DidChangeAnalysisReadinessParams;
+import org.sonarsource.sonarlint.core.rpc.protocol.client.analysis.GetFileExclusionsParams;
+import org.sonarsource.sonarlint.core.rpc.protocol.client.analysis.GetFileExclusionsResponse;
+import org.sonarsource.sonarlint.core.rpc.protocol.client.analysis.GetInferredAnalysisPropertiesParams;
+import org.sonarsource.sonarlint.core.rpc.protocol.client.analysis.GetInferredAnalysisPropertiesResponse;
+import org.sonarsource.sonarlint.core.rpc.protocol.client.binding.AssistBindingParams;
+import org.sonarsource.sonarlint.core.rpc.protocol.client.binding.AssistBindingResponse;
+import org.sonarsource.sonarlint.core.rpc.protocol.client.binding.NoBindingSuggestionFoundParams;
+import org.sonarsource.sonarlint.core.rpc.protocol.client.binding.SuggestBindingParams;
+import org.sonarsource.sonarlint.core.rpc.protocol.client.branch.DidChangeMatchedSonarProjectBranchParams;
+import org.sonarsource.sonarlint.core.rpc.protocol.client.branch.MatchSonarProjectBranchParams;
+import org.sonarsource.sonarlint.core.rpc.protocol.client.branch.MatchSonarProjectBranchResponse;
+import org.sonarsource.sonarlint.core.rpc.protocol.client.connection.AssistCreatingConnectionParams;
+import org.sonarsource.sonarlint.core.rpc.protocol.client.connection.AssistCreatingConnectionResponse;
+import org.sonarsource.sonarlint.core.rpc.protocol.client.connection.GetCredentialsParams;
+import org.sonarsource.sonarlint.core.rpc.protocol.client.connection.GetCredentialsResponse;
+import org.sonarsource.sonarlint.core.rpc.protocol.client.connection.SuggestConnectionParams;
+import org.sonarsource.sonarlint.core.rpc.protocol.client.event.DidReceiveServerHotspotEvent;
+import org.sonarsource.sonarlint.core.rpc.protocol.client.fs.GetBaseDirParams;
+import org.sonarsource.sonarlint.core.rpc.protocol.client.fs.GetBaseDirResponse;
+import org.sonarsource.sonarlint.core.rpc.protocol.client.fs.ListFilesParams;
+import org.sonarsource.sonarlint.core.rpc.protocol.client.fs.ListFilesResponse;
+import org.sonarsource.sonarlint.core.rpc.protocol.client.hotspot.RaiseHotspotsParams;
+import org.sonarsource.sonarlint.core.rpc.protocol.client.hotspot.ShowHotspotParams;
+import org.sonarsource.sonarlint.core.rpc.protocol.client.http.CheckServerTrustedParams;
+import org.sonarsource.sonarlint.core.rpc.protocol.client.http.CheckServerTrustedResponse;
+import org.sonarsource.sonarlint.core.rpc.protocol.client.http.GetProxyPasswordAuthenticationParams;
+import org.sonarsource.sonarlint.core.rpc.protocol.client.http.GetProxyPasswordAuthenticationResponse;
+import org.sonarsource.sonarlint.core.rpc.protocol.client.http.SelectProxiesParams;
+import org.sonarsource.sonarlint.core.rpc.protocol.client.http.SelectProxiesResponse;
+import org.sonarsource.sonarlint.core.rpc.protocol.client.info.GetClientLiveInfoResponse;
+import org.sonarsource.sonarlint.core.rpc.protocol.client.issue.RaiseIssuesParams;
+import org.sonarsource.sonarlint.core.rpc.protocol.client.issue.RaisedFindingDto;
+import org.sonarsource.sonarlint.core.rpc.protocol.client.issue.ShowIssueParams;
+import org.sonarsource.sonarlint.core.rpc.protocol.client.log.LogParams;
+import org.sonarsource.sonarlint.core.rpc.protocol.client.message.ShowMessageParams;
+import org.sonarsource.sonarlint.core.rpc.protocol.client.message.ShowSoonUnsupportedMessageParams;
+import org.sonarsource.sonarlint.core.rpc.protocol.client.progress.ReportProgressParams;
+import org.sonarsource.sonarlint.core.rpc.protocol.client.progress.StartProgressParams;
+import org.sonarsource.sonarlint.core.rpc.protocol.client.sca.DidChangeDependencyRisksParams;
+import org.sonarsource.sonarlint.core.rpc.protocol.client.smartnotification.ShowSmartNotificationParams;
+import org.sonarsource.sonarlint.core.rpc.protocol.client.sync.DidSynchronizeConfigurationScopeParams;
+import org.sonarsource.sonarlint.core.rpc.protocol.client.taint.vulnerability.DidChangeTaintVulnerabilitiesParams;
+import org.sonarsource.sonarlint.core.rpc.protocol.client.telemetry.TelemetryClientLiveAttributesResponse;
+import org.sonarsource.sonarlint.core.rpc.protocol.common.ClientFileDto;
+import org.sonarsource.sonarlint.core.rpc.protocol.common.TokenDto;
+import org.springframework.util.StringUtils;
+
+public class SonarLintCliRpcClient implements SonarLintRpcClient {
+
+  private final List<ClientFileDto> inputFiles;
+
+  private static final Logger logger = LoggerFactory.getLogger(SonarLintCliRpcClient.class);
+
+  private CountDownLatch configurationSynchronizationLatch;
+
+  private final Set<String> finishedProgresses = new HashSet<>();
+
+  private final Map<URI, Collection<RaisedFindingDto>> issues = new HashMap<>();
+
+  private final String baseDir;
+
+  private final String token;
+
+  public SonarLintCliRpcClient(String baseDir, List<ClientFileDto> inputFiles, String token) {
+    this.baseDir = baseDir;
+    this.inputFiles = inputFiles;
+    this.token = token;
+  }
+
+  public Map<URI, Collection<RaisedFindingDto>> getIssues() {
+    return issues;
+  }
+
+  @Override
+  public void log(LogParams params) {
+    var localLogger = LoggerFactory.getLogger(params.getLoggerName());
+    var level = Level.valueOf(params.getLevel().name());
+    if (localLogger.isEnabledForLevel(level)) {
+      var message = StringUtils.hasText(params.getMessage()) ? params.getMessage() : "";
+      var stacktrace = StringUtils.hasText(params.getStackTrace()) ? params.getStackTrace() : "";
+      localLogger.atLevel(level).setMessage(message + stacktrace).log();
+    }
+  }
+
+  @Override
+  public CompletableFuture<Void> startProgress(StartProgressParams params) {
+    logger.info("Starting progress {} with id {}", params.getTitle(), params.getTaskId());
+    return getCompletedFuture(null);
+  }
+
+  @Override
+  @SuppressWarnings("java:S2446") // notify is correct here, there is just a single waiting thread
+  public synchronized void reportProgress(ReportProgressParams params) {
+    if (params.getNotification().isLeft()) {
+      var updateNotification = params.getNotification().getLeft();
+      logger.info("Progress id {} status {} message {}", params.getTaskId(), updateNotification.getPercentage(), updateNotification.getMessage());
+    } else {
+      finishedProgresses.add(params.getTaskId());
+      logger.info("Progress id {} ended", params.getTaskId());
+      notify();
+    }
+  }
+
+  public synchronized void waitForProgress(String taskId) {
+    while (!finishedProgresses.contains(taskId)) {
+      try {
+        wait();
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new RuntimeException("Interrupted while waiting for progress " + taskId, e);
+      }
+    }
+    finishedProgresses.remove(taskId);
+  }
+
+  @Override
+  public void didSynchronizeConfigurationScopes(DidSynchronizeConfigurationScopeParams params) {
+    logger.info("Configuration scopes synchronized {}", params.getConfigurationScopeIds());
+    configurationSynchronizationLatch.countDown();
+  }
+
+  public void resetConfigurationSynchronizationWait() {
+    configurationSynchronizationLatch = new CountDownLatch(1);
+  }
+
+  public void waitForConfigurationSynchronization() throws InterruptedException {
+    if (!configurationSynchronizationLatch.await(2, TimeUnit.MINUTES)) {
+      throw new SonarLintException("Timeout waiting for configuration synchronization");
+    }
+  }
+
+  @Override
+  public CompletableFuture<GetCredentialsResponse> getCredentials(GetCredentialsParams params) {
+    return getCompletedFuture(new GetCredentialsResponse(new TokenDto(token)));
+  }
+
+  @Override
+  public CompletableFuture<SelectProxiesResponse> selectProxies(SelectProxiesParams params) {
+    return getCompletedFuture(new SelectProxiesResponse(List.of()));
+  }
+
+  @Override
+  public CompletableFuture<MatchSonarProjectBranchResponse> matchSonarProjectBranch(MatchSonarProjectBranchParams params) {
+    return getCompletedFuture(new MatchSonarProjectBranchResponse(params.getMainSonarBranchName()));
+  }
+
+  @Override
+  public CompletableFuture<GetBaseDirResponse> getBaseDir(GetBaseDirParams params) {
+    return getCompletedFuture(new GetBaseDirResponse(Path.of(baseDir)));
+  }
+
+  @Override
+  public CompletableFuture<ListFilesResponse> listFiles(ListFilesParams params) {
+    return getCompletedFuture(new ListFilesResponse(inputFiles));
+  }
+
+  @Override
+  public void didChangeAnalysisReadiness(DidChangeAnalysisReadinessParams params) {
+    logger.info("Analysis readiness changed to {}", params.areReadyForAnalysis());
+  }
+
+  @Override
+  public CompletableFuture<GetInferredAnalysisPropertiesResponse> getInferredAnalysisProperties(GetInferredAnalysisPropertiesParams params) {
+    return getCompletedFuture(new GetInferredAnalysisPropertiesResponse(Map.of()));
+  }
+
+  @Override
+  public void raiseHotspots(RaiseHotspotsParams params) {
+    for (var hotspotEntry : params.getHotspotsByFileUri().entrySet()) {
+      var fileUri = hotspotEntry.getKey();
+      var fileIssues = hotspotEntry.getValue();
+      if (!fileIssues.isEmpty()) {
+        var existingIssues = issues.computeIfAbsent(fileUri, k -> new ArrayList<>());
+        existingIssues.addAll(hotspotEntry.getValue());
+      }
+    }
+  }
+
+  @Override
+  public void raiseIssues(RaiseIssuesParams params) {
+    for (var issuesEntry : params.getIssuesByFileUri().entrySet()) {
+      var fileUri = issuesEntry.getKey();
+      var fileIssues = issuesEntry.getValue();
+      if (!fileIssues.isEmpty()) {
+        var existingIssues = issues.computeIfAbsent(fileUri, k -> new ArrayList<>());
+        existingIssues.addAll(fileIssues);
+      }
+    }
+  }
+
+  private <T> CompletableFuture<T> getCompletedFuture(T value) {
+    var result = new CompletableFuture<T>();
+    result.complete(value);
+    return result;
+  }
+
+  @Override
+  public void suggestBinding(SuggestBindingParams params) {
+    throw new UnsupportedOperationException("Not implemented yet");
+  }
+
+  @Override
+  public void suggestConnection(SuggestConnectionParams params) {
+    throw new UnsupportedOperationException("Not implemented yet");
+
+  }
+
+  @Override
+  public void openUrlInBrowser(OpenUrlInBrowserParams params) {
+    throw new UnsupportedOperationException("Not implemented yet");
+
+  }
+
+  @Override
+  public void showMessage(ShowMessageParams params) {
+    throw new UnsupportedOperationException("Not implemented yet");
+  }
+
+  @Override
+  public void showSoonUnsupportedMessage(ShowSoonUnsupportedMessageParams params) {
+    throw new UnsupportedOperationException("Not implemented yet");
+  }
+
+  @Override
+  public void showSmartNotification(ShowSmartNotificationParams params) {
+    throw new UnsupportedOperationException("Not implemented yet");
+  }
+
+  @Override
+  public CompletableFuture<GetClientLiveInfoResponse> getClientLiveInfo() {
+    throw new UnsupportedOperationException("Not implemented yet");
+  }
+
+  @Override
+  public void showHotspot(ShowHotspotParams params) {
+    throw new UnsupportedOperationException("Not implemented yet");
+  }
+
+  @Override
+  public void showIssue(ShowIssueParams params) {
+    throw new UnsupportedOperationException("Not implemented yet");
+  }
+
+  @Override
+  public CompletableFuture<AssistCreatingConnectionResponse> assistCreatingConnection(AssistCreatingConnectionParams params) {
+    throw new UnsupportedOperationException("Not implemented yet");
+  }
+
+  @Override
+  public CompletableFuture<AssistBindingResponse> assistBinding(AssistBindingParams params) {
+    throw new UnsupportedOperationException("Not implemented yet");
+  }
+
+  @Override
+  public CompletableFuture<TelemetryClientLiveAttributesResponse> getTelemetryLiveAttributes() {
+    throw new UnsupportedOperationException("Not implemented yet");
+  }
+
+  @Override
+  public CompletableFuture<GetProxyPasswordAuthenticationResponse> getProxyPasswordAuthentication(GetProxyPasswordAuthenticationParams params) {
+    throw new UnsupportedOperationException("Not implemented yet");
+  }
+
+  @Override
+  public CompletableFuture<CheckServerTrustedResponse> checkServerTrusted(CheckServerTrustedParams params) {
+    throw new UnsupportedOperationException("Not implemented yet");
+  }
+
+  @Override
+  public void didReceiveServerHotspotEvent(DidReceiveServerHotspotEvent params) {
+    throw new UnsupportedOperationException("Not implemented yet");
+  }
+
+  @Override
+  public void didChangeMatchedSonarProjectBranch(DidChangeMatchedSonarProjectBranchParams params) {
+    throw new UnsupportedOperationException("Not implemented yet");
+  }
+  @Override
+  public void didChangeTaintVulnerabilities(DidChangeTaintVulnerabilitiesParams params) {
+    throw new UnsupportedOperationException("Not implemented yet");
+  }
+
+  @Override
+  public void didChangeDependencyRisks(DidChangeDependencyRisksParams params) {
+    throw new UnsupportedOperationException("Not implemented yet");
+  }
+
+  @Override
+  public void noBindingSuggestionFound(NoBindingSuggestionFoundParams params) {
+    throw new UnsupportedOperationException("Not implemented yet");
+  }
+
+  @Override
+  public CompletableFuture<GetFileExclusionsResponse> getFileExclusions(GetFileExclusionsParams params) {
+    throw new UnsupportedOperationException("Not implemented yet");
+  }
+}

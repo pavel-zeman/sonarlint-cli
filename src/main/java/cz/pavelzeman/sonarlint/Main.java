@@ -1,112 +1,171 @@
 package cz.pavelzeman.sonarlint;
 
-import java.io.*;
-import java.net.URI;
-import java.nio.charset.Charset;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
-import java.util.concurrent.ExecutionException;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.slf4j.event.Level;
-import org.sonarsource.sonarlint.core.ConnectedSonarLintEngineImpl;
-import org.sonarsource.sonarlint.core.analysis.api.ClientInputFile;
-import org.sonarsource.sonarlint.core.client.api.common.analysis.Issue;
-import org.sonarsource.sonarlint.core.client.api.connected.ConnectedAnalysisConfiguration;
-import org.sonarsource.sonarlint.core.client.api.connected.ConnectedGlobalConfiguration;
-import org.sonarsource.sonarlint.core.client.api.connected.ConnectedRuleDetails;
-import org.sonarsource.sonarlint.core.commons.IssueSeverity;
-import org.sonarsource.sonarlint.core.commons.Language;
-import org.sonarsource.sonarlint.core.commons.Version;
-import org.sonarsource.sonarlint.core.commons.log.ClientLogOutput;
-import org.sonarsource.sonarlint.core.http.HttpClientProvider;
-import org.sonarsource.sonarlint.core.serverapi.EndpointParams;
-import org.sonarsource.sonarlint.shaded.org.springframework.util.AntPathMatcher;
-import org.sonarsource.sonarlint.shaded.org.springframework.util.StringUtils;
+import org.sonarsource.sonarlint.core.ConfigurationService;
+import org.sonarsource.sonarlint.core.analysis.AnalysisService;
+import org.sonarsource.sonarlint.core.commons.log.LogOutput.Level;
+import org.sonarsource.sonarlint.core.commons.log.SonarLintLogger;
+import org.sonarsource.sonarlint.core.repository.rules.RulesRepository;
+import org.sonarsource.sonarlint.core.rpc.protocol.backend.config.binding.BindingConfigurationDto;
+import org.sonarsource.sonarlint.core.rpc.protocol.backend.config.scope.ConfigurationScopeDto;
+import org.sonarsource.sonarlint.core.rpc.protocol.backend.connection.config.SonarQubeConnectionConfigurationDto;
+import org.sonarsource.sonarlint.core.rpc.protocol.backend.initialize.BackendCapability;
+import org.sonarsource.sonarlint.core.rpc.protocol.backend.initialize.ClientConstantInfoDto;
+import org.sonarsource.sonarlint.core.rpc.protocol.backend.initialize.HttpConfigurationDto;
+import org.sonarsource.sonarlint.core.rpc.protocol.backend.initialize.InitializeParams;
+import org.sonarsource.sonarlint.core.rpc.protocol.backend.initialize.SslConfigurationDto;
+import org.sonarsource.sonarlint.core.rpc.protocol.backend.initialize.TelemetryClientConstantAttributesDto;
+import org.sonarsource.sonarlint.core.rpc.protocol.backend.log.LogLevel;
+import org.sonarsource.sonarlint.core.rpc.protocol.common.ClientFileDto;
+import org.sonarsource.sonarlint.core.rpc.protocol.common.IssueSeverity;
+import org.sonarsource.sonarlint.core.rpc.protocol.common.Language;
+import org.sonarsource.sonarlint.core.spring.SpringApplicationContextInitializer;
+import org.springframework.util.AntPathMatcher;
+import org.springframework.util.StringUtils;
 
-/**
- * Main sonarlint class.
- */
 public class Main {
 
-  private static final Logger logger = LoggerFactory.getLogger(Main.class);
+  private static final String CONFIGURATION_SCOPE_ID = "sonarLintCliConfigurationScope";
+  private static final String CONNECTION_ID = "sonarLintCliConnection";
 
   /**
    * Configuration read from input properties file.
    */
   private Configuration configuration;
 
-  /**
-   * Sonarlint engine.
-   */
-  private ConnectedSonarLintEngineImpl engine;
+  private SpringApplicationContextInitializer initializer;
 
-  /**
-   * List of all files to be analyzed.
-   */
-  private List<ClientInputFile> inputFiles;
+  private List<ClientFileDto> inputFiles = new ArrayList<>();
 
-  /**
-   * List of all identified issues.
-   */
-  private List<Issue> issueList;
+  private static final Set<BackendCapability> disabledBackendCapabilities = Set.of(
+      BackendCapability.EMBEDDED_SERVER,
+      BackendCapability.FLIGHT_RECORDER,
+      BackendCapability.ISSUE_STREAMING,
+      BackendCapability.TELEMETRY,
+      BackendCapability.MONITORING
+  );
+
+  private InitializeParams createInitializeParams() {
+    return new InitializeParams(
+        new ClientConstantInfoDto("SonarLint CLI", "SonarLint CLI"),
+        new TelemetryClientConstantAttributesDto("sonarLintCli", "SonarLint CLI", "0.0.0", "0.0.0", null),
+        new HttpConfigurationDto(
+            new SslConfigurationDto(null, null, null, null, null, null),
+            null,
+            null,
+            null,
+            null
+        ),
+        null,
+        new HashSet<>(Arrays.asList(BackendCapability.values()).stream().filter(c -> !disabledBackendCapabilities.contains(c)).toList()),
+        Path.of(System.getProperty("user.home"), ".sonarlint-cli", "storage"),
+        Path.of(System.getProperty("user.home"), ".sonarlint-cli", "work"),
+        null,
+        null,
+        new HashSet<>(Arrays.asList(Language.values())),
+        null,
+        null,
+        List.of(
+            new SonarQubeConnectionConfigurationDto(CONNECTION_ID, configuration.getHost(), true)
+        ),
+        null,
+        null,
+        null,
+        false,
+        null,
+        false,
+        null,
+        LogLevel.TRACE
+    );
+  }
+
+  private ConfigurationScopeDto getConfigurationScope() {
+    return new ConfigurationScopeDto(
+        CONFIGURATION_SCOPE_ID,
+        null,
+        true,
+        CONFIGURATION_SCOPE_ID,
+        new BindingConfigurationDto(CONNECTION_ID, configuration.getProjectKey(), true)
+    );
+  }
+
+  public String escapeStringForTc(String input) {
+    if (input == null) {
+      input = "";
+    }
+    input = input.replace("|", "||");
+    input = input.replace("\n", "|n");
+    input = input.replace("\r", "|r");
+    input = input.replace("'", "|'");
+    input = input.replace("[", "|[");
+    input = input.replace("]", "|]");
+    return input;
+  }
 
   private static String getSeverity(IssueSeverity severity) {
-    switch (severity) {
-      case BLOCKER:
-      case CRITICAL:
-        return "ERROR";
-      case MAJOR:
-        return "WARNING";
-      case MINOR:
-      case INFO:
-        return "WEAK WARNING";
-      default:
-        throw new SonarLintException("Unexpected severity - " + severity);
+    if (severity == null) {
+      throw new SonarLintException("Unexpected severity");
+    } else {
+      return switch (severity) {
+        case BLOCKER, CRITICAL -> "ERROR";
+        case MAJOR -> "WARNING";
+        case MINOR, INFO -> "WEAK WARNING";
+      };
     }
   }
 
-  private boolean isExcluded(Path file) {
-    if (configuration.getExclusions() != null) {
-      AntPathMatcher matcher = new AntPathMatcher(File.separator);
-      for (String exclusion : configuration.getExclusions()) {
-        if (matcher.match(exclusion, file.toString())) {
-          return true;
+  private void reportResults(SonarLintCliRpcClient client) {
+    var rulesRepository = initializer.getInitializedApplicationContext().getBean(RulesRepository.class);
+
+    var issues = client.getIssues();
+    var rootPath = Path.of(configuration.getProjectBaseDir());
+    var ruleSet = new HashSet<String>();
+    for (var issueEntry : issues.entrySet()) {
+      var fileUri = issueEntry.getKey();
+      var absoluteFilePath = Path.of(fileUri);
+      var relativeFilePath = rootPath.relativize(absoluteFilePath);
+      for (var issue : issueEntry.getValue()) {
+        var ruleKey = issue.getRuleKey();
+        if (!ruleSet.contains(ruleKey)) {
+          ruleSet.add(ruleKey);
+          var rule = rulesRepository.getRule(CONNECTION_ID, ruleKey).get();
+          System.out.printf("##teamcity[inspectionType id='%s' name='%s' description='%s' category='%s']%n",
+              ruleKey,
+              escapeStringForTc(ruleKey + " - " + rule.getName()),
+              // Description is mandatory, so use name as description, if name is not available
+              escapeStringForTc(StringUtils.hasText(rule.getHtmlDescription()) ? rule.getHtmlDescription() : rule.getName()),
+              rule.getType().name()
+          );
         }
+        var severityMode = issue.getSeverityMode();
+        System.out.printf("##teamcity[inspection typeId='%s' message='%s' file='%s' line='%d' severity='%s']%n",
+            ruleKey,
+            escapeStringForTc(issue.getPrimaryMessage()),
+            relativeFilePath,
+            issue.getTextRange() == null ? 0 : issue.getTextRange().getStartLine(),
+            getSeverity(severityMode.isLeft() ? severityMode.getLeft().getSeverity() : null)
+        );
       }
     }
-    return false;
-  }
-
-  private void listFiles(Path path) {
-    try (var stream = Files.list(path)) {
-      stream.forEach(file -> {
-        if (Files.isDirectory(file)) {
-          listFiles(file);
-        } else if (!isExcluded(file)) {
-          inputFiles.add(new InputFile(file));
-        }
-      });
-    } catch (IOException e) {
-      throw new SonarLintException("Error when getting list of files to analyze", e);
-    }
-  }
-
-  public static void main(String[] args) {
-    new Main().run(args);
-    // The engine sometimes keeps running in a separate thread, so we have to force exit here
-    System.exit(0);
   }
 
   private String getProperty(Properties properties, String property) {
     return properties.getProperty("sonar." + property);
+  }
+
+  private String getAbsolutePathProperty(Properties properties, String property) {
+    var value = getProperty(properties, property);
+    return value == null ? null : Path.of(value).toAbsolutePath().toString();
   }
 
   private String[] parseSources(String sources) {
@@ -127,232 +186,102 @@ public class Main {
     try (var inputStream = new FileInputStream(file)) {
       properties.load(inputStream);
     } catch (IOException e) {
-        throw new SonarLintException("Error when reading configuration file", e);
+      throw new SonarLintException("Error when reading configuration file", e);
     }
     configuration = new Configuration(
         getProperty(properties, Configuration.Properties.HOST),
         getProperty(properties, Configuration.Properties.TOKEN),
         getProperty(properties, Configuration.Properties.PROJECT_KEY),
         parseSources(getProperty(properties, Configuration.Properties.SOURCES)),
-        getProperty(properties, Configuration.Properties.PROJECT_BASE_DIR),
+        getAbsolutePathProperty(properties, Configuration.Properties.PROJECT_BASE_DIR),
         parseExclusions(getProperty(properties, Configuration.Properties.EXCLUSIONS))
     );
   }
 
-  private Path getStorageRoot() {
-    var home = System.getProperty("user.home");
-    return Path.of(home, ".sonarlint-cli");
-  }
-
-  private String getNodeVersion(String nodePath) {
-    try {
-      var process = new ProcessBuilder(nodePath, "--version").start();
-      var reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
-      var output = new StringBuilder();
-      String line;
-      while ((line = reader.readLine()) != null) {
-        output.append(line).append("\n");
-      }
-      var version = output.toString().trim();
-      if (version.startsWith("v")) {
-        version = version.substring(1);
-      }
-      return version;
-    } catch (IOException e) {
-      throw new SonarLintException("Error when getting Node.js version", e);
-    }
-  }
-
-  private String getNodePath() {
-    var os = System.getProperty("os.name").toLowerCase();
-    String executable;
-    if (os.contains("win")) {
-      executable = "where";
-    } else if (os.contains("nix") || os.contains("nux") || os.contains("mac")) {
-      executable = "which";
-    } else {
-      throw new SonarLintException("Unsupported OS: " + os);
-    }
-    try {
-      var process = new ProcessBuilder(executable, "node").start();
-      BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
-      return reader.readLine();
-    } catch (IOException e) {
-      throw new SonarLintException("Error when getting Node.js executable path", e);
-    }
-  }
-
-  private void createEngine() {
-    var builder = ConnectedGlobalConfiguration.sonarQubeBuilder()
-        .addEnabledLanguages(Language.JS)
-        .addEnabledLanguages(Language.TS)
-        .addEnabledLanguages(Language.CSS)
-        .addEnabledLanguages(Language.HTML)
-        .addEnabledLanguages(Language.JAVA)
-        .addEnabledLanguages(Language.XML)
-        .addEnabledLanguages(Language.YAML)
-        .addEnabledLanguages(Language.JSON)
-        .setConnectionId("sonarlint-cli")
-        .setStorageRoot(getStorageRoot())
-        // Use huge number here, because Sonar counts files in node_modules as well and if the file count is too high, advanced JS analysis based on TS is disabled
-        .setExtraProperties(Map.of("sonar.javascript.sonarlint.typechecking.maxfiles", "10000000"));
-
-    var nodePath = getNodePath();
-    if (StringUtils.hasText(nodePath)) {
-      var nodeVersion = getNodeVersion(nodePath);
-      builder.setNodeJs(Path.of(nodePath), Version.create(nodeVersion));
-    } else {
-      logger.warn("No Node.js found in path, some inspections may be skipped");
-    }
-
-    var sonarConfiguration = builder.build();
-
-    engine = new ConnectedSonarLintEngineImpl(sonarConfiguration);
-    var httpClientProvider = new HttpClientProvider("sonarlint-cli", null, null, null, null);
-    var endpointParams = new EndpointParams(configuration.getHost(), false, null);
-    var httpClient = httpClientProvider.getHttpClientWithPreemptiveAuth(configuration.getToken(), null);
-    engine.sync(endpointParams, httpClient, Set.of(configuration.getProjectKey()), null);
-  }
-
   private void getInputFiles() {
     inputFiles = new ArrayList<>();
-    for (String sourcePath : configuration.getSources()) {
-      listFiles(Path.of(sourcePath));
+    for (String sourcePathString : configuration.getSources()) {
+      var sourcePath = Path.of(configuration.getProjectBaseDir(), sourcePathString);
+      listFiles(sourcePath, sourcePath);
     }
   }
 
-  private Level transformLevelToSlf4j(ClientLogOutput.Level level) {
-    switch (level) {
-      case ERROR: return Level.ERROR;
-      case WARN:return Level.WARN;
-      case INFO:return Level.INFO;
-      case DEBUG:return Level.DEBUG;
-      default: return Level.TRACE;
-    }
-  }
-
-  private void analyze() {
-    var builder = ConnectedAnalysisConfiguration.builder();
-    builder.setBaseDir(Path.of(configuration.getProjectBaseDir()));
-    builder.addInputFiles(inputFiles);
-    builder.setProjectKey(configuration.getProjectKey());
-
-    issueList = new ArrayList<>();
-
-    engine.analyze(
-        builder.build(),
-        issue -> issueList.add(issue),
-        (s, level) -> logger.atLevel(transformLevelToSlf4j(level)).log(s),
-        null
-    );
-  }
-
-  public String escapeStringForTc(String input) {
-    input = input.replace("|", "||");
-    input = input.replace("\n", "|n");
-    input = input.replace("\r", "|r");
-    input = input.replace("'", "|'");
-    input = input.replace("[", "|[");
-    input = input.replace("]", "|]");
-    return input;
-  }
-
-  @SuppressWarnings("java:S106") // System.out is fine here, because it is the way to communicate with TC
-  private void reportResults() {
-    var ruleSet = new HashSet<String>();
-    for (Issue issue : issueList) {
-      ConnectedRuleDetails ruleDetails;
-      try {
-        ruleDetails = engine.getActiveRuleDetails(null, null, issue.getRuleKey(), null).get();
-      } catch (InterruptedException | ExecutionException e) {
-        Thread.currentThread().interrupt();
-        throw new SonarLintException("Error when getting rule details", e);
+  private boolean isExcluded(Path file) {
+    if (configuration.getExclusions() != null) {
+      var matcher = new AntPathMatcher();
+      for (String exclusion : configuration.getExclusions()) {
+        if (matcher.match(exclusion, file.toString())) {
+          return true;
+        }
       }
-      var ruleKey = issue.getRuleKey();
-      if (!ruleSet.contains(ruleKey)) {
-        ruleSet.add(ruleKey);
-        System.out.printf("##teamcity[inspectionType id='%s' name='%s' description='%s' category='%s']%n",
-            ruleKey,
-            escapeStringForTc(ruleKey + " - " + ruleDetails.getName()),
-            escapeStringForTc(ruleDetails.getHtmlDescription()),
-            ruleDetails.getType().name()
-            );
-      }
-      //noinspection DataFlowIssue issue.getInputFile() should not be null here
-      System.out.printf("##teamcity[inspection typeId='%s' message='%s' file='%s' line='%d' severity='%s']%n",
-          ruleKey,
-          escapeStringForTc(issue.getMessage()),
-          issue.getInputFile().relativePath(),
-          issue.getStartLine() == null ? 0 : issue.getStartLine(),
-          getSeverity(issue.getSeverity())
-      );
+    }
+    return false;
+  }
+
+  private void listFiles(Path path, Path root) {
+    try (var stream = Files.list(path)) {
+      stream.forEach(file -> {
+        if (Files.isDirectory(file)) {
+          listFiles(file, root);
+        } else if (!isExcluded(file)) {
+          inputFiles.add(new ClientFileDto(
+              file.toUri(),
+              root.relativize(file), // get file path relative to root
+              CONFIGURATION_SCOPE_ID,
+              Boolean.FALSE,
+              null,
+              file,
+              null,
+              null,
+              true
+          ));
+        }
+      });
+    } catch (IOException e) {
+      throw new SonarLintException("Error when getting list of files to analyze", e);
     }
   }
 
-  private void stopEngine() {
-    engine.stop(false);
+  private SonarLintCliRpcClient analyze() {
+    var client = new SonarLintCliRpcClient(configuration.getProjectBaseDir(), inputFiles, configuration.getToken());
+    var params = createInitializeParams();
+    SonarLintLogger.get().setTarget(new SonarLintCliLogOutput(client));
+    SonarLintLogger.get().setLevel(Level.INFO);
+    initializer = new SpringApplicationContextInitializer(client, params);
+    var configurationService = initializer.getInitializedApplicationContext().getBean(ConfigurationService.class);
+    client.resetConfigurationSynchronizationWait();
+    configurationService.didAddConfigurationScopes(List.of(getConfigurationScope()));
+    try {
+      client.waitForConfigurationSynchronization();
+    } catch (InterruptedException e) {
+      throw new cz.pavelzeman.sonarlint.SonarLintException("Error when waiting for synchronization", e);
+    }
+    var analysisService = initializer.getInitializedApplicationContext().getBean(AnalysisService.class);
+    var analysisId = analysisService.analyzeFullProject(CONFIGURATION_SCOPE_ID, false);
+    client.waitForProgress(analysisId.toString());
+    return client;
   }
 
-  @SuppressWarnings("java:S106") // System.err is used to print usage information
-  private void run(String[] args) {
+  private void run(String... args) {
     if (args.length != 1) {
       System.err.println("Usage: java -jar sonarlint-cli.jar <path to sonar-project.properties>");
       System.exit(1);
     }
     parseConfiguration(args[0]);
-    createEngine();
     getInputFiles();
-    analyze();
-    reportResults();
-    stopEngine();
+    var client = analyze();
+    reportResults(client);
   }
 
-  private static class InputFile implements ClientInputFile {
-
-    private final Path file;
-
-    public InputFile(Path file) {
-      this.file = file;
+  public static void main(String... args) {
+    try {
+      new Main().run(args);
+    } catch (Throwable t) {
+      t.printStackTrace();
+      // The engine sometimes keeps running in a separate thread, so we have to force exit here
+      System.exit(1);
     }
-
-    @Override
-    public String getPath() {
-      return file.toAbsolutePath().toString();
-    }
-
-    @Override
-    public boolean isTest() {
-      return false;
-    }
-
-    @Override
-    public Charset getCharset() {
-      return null;
-    }
-
-    @Override
-    public <G> G getClientObject() {
-      return null;
-    }
-
-    @Override
-    public InputStream inputStream() throws IOException {
-      return new FileInputStream(file.toFile());
-    }
-
-    @Override
-    public String contents() throws IOException {
-      return Files.readString(file);
-    }
-
-    @Override
-    public String relativePath() {
-      return file.toString();
-    }
-
-    @Override
-    public URI uri() {
-      return file.toUri();
-    }
+    // The engine sometimes keeps running in a separate thread, so we have to force exit here
+    System.exit(0);
   }
 }

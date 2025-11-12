@@ -5,7 +5,7 @@ The functionality is similar to [sonarlint-cli](https://github.com/SonarSource/s
 as explained by a SonarQube representative in [this discussion](https://groups.google.com/g/sonarqube/c/WlALjVzp-OE/m/Ev3QpnaOBAAJ).
 
 # Usage
-The tool is distributed as a single JAR file, which can be run using Java version 11+ as follows:
+The tool is distributed as a single JAR file, which can be run using Java version 17+ as follows:
 ```
 java -jar sonarlint-cli-<version>.jar <path to configuration file>
 ```
