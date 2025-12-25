@@ -35,6 +35,7 @@
                     <archive>
                         <manifest>
                             <addClasspath>false</addClasspath>
+                            <addDefaultImplementationEntries>true</addDefaultImplementationEntries>
                             <mainClass>cz.pavelzeman.sonarlint.Main</mainClass>
                         </manifest>
                     </archive>

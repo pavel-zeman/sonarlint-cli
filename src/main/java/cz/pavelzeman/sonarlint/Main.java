@@ -7,18 +7,25 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Properties;
 import java.util.Set;
+import java.util.jar.Manifest;
+import org.sonar.api.batch.fs.InputFile;
+import org.sonar.api.batch.fs.InputFile.Type;
 import org.sonarsource.sonarlint.core.ConfigurationService;
+import org.sonarsource.sonarlint.core.ServerFileExclusions;
 import org.sonarsource.sonarlint.core.analysis.AnalysisService;
-import org.sonarsource.sonarlint.core.commons.log.LogOutput.Level;
 import org.sonarsource.sonarlint.core.commons.log.SonarLintLogger;
+import org.sonarsource.sonarlint.core.fs.ClientFileSystemService;
+import org.sonarsource.sonarlint.core.plugin.commons.sonarapi.MapSettings;
 import org.sonarsource.sonarlint.core.repository.rules.RulesRepository;
 import org.sonarsource.sonarlint.core.rpc.protocol.backend.config.binding.BindingConfigurationDto;
 import org.sonarsource.sonarlint.core.rpc.protocol.backend.config.scope.ConfigurationScopeDto;
 import org.sonarsource.sonarlint.core.rpc.protocol.backend.connection.config.SonarQubeConnectionConfigurationDto;
+import org.sonarsource.sonarlint.core.rpc.protocol.backend.file.DidUpdateFileSystemParams;
 import org.sonarsource.sonarlint.core.rpc.protocol.backend.initialize.BackendCapability;
 import org.sonarsource.sonarlint.core.rpc.protocol.backend.initialize.ClientConstantInfoDto;
 import org.sonarsource.sonarlint.core.rpc.protocol.backend.initialize.HttpConfigurationDto;
@@ -30,9 +37,10 @@ import org.sonarsource.sonarlint.core.rpc.protocol.common.ClientFileDto;
 import org.sonarsource.sonarlint.core.rpc.protocol.common.IssueSeverity;
 import org.sonarsource.sonarlint.core.rpc.protocol.common.Language;
 import org.sonarsource.sonarlint.core.spring.SpringApplicationContextInitializer;
-import org.springframework.util.AntPathMatcher;
+import org.sonarsource.sonarlint.core.storage.StorageService;
 import org.springframework.util.StringUtils;
 
+@SuppressWarnings("java:S106") // This is a command line application, so using standard input/output is necessary
 public class Main {
 
   private static final String CONFIGURATION_SCOPE_ID = "sonarLintCliConfigurationScope";
@@ -45,20 +53,42 @@ public class Main {
 
   private SpringApplicationContextInitializer initializer;
 
+  private SonarLintCliRpcClient client;
+
   private List<ClientFileDto> inputFiles = new ArrayList<>();
+
+  private ServerFileExclusions exclusionFilters;
 
   private static final Set<BackendCapability> disabledBackendCapabilities = Set.of(
       BackendCapability.EMBEDDED_SERVER,
       BackendCapability.FLIGHT_RECORDER,
       BackendCapability.ISSUE_STREAMING,
       BackendCapability.TELEMETRY,
-      BackendCapability.MONITORING
+      BackendCapability.GESSIE_TELEMETRY,
+      BackendCapability.MONITORING,
+      BackendCapability.SMART_NOTIFICATIONS,
+      BackendCapability.SERVER_SENT_EVENTS
   );
 
-  private InitializeParams createInitializeParams() {
+  private String getVersion() throws IOException {
+    var manifestResource = getClass().getResourceAsStream("/META-INF/MANIFEST.MF");
+    var version = "unknown";
+    if (manifestResource != null) {
+      var manifest = new Manifest(manifestResource);
+      var attrs = manifest.getMainAttributes();
+      var manifestVersion = attrs.getValue("Implementation-Version");
+      if (manifestVersion != null) {
+        version = manifestVersion;
+      }
+    }
+    return version;
+  }
+
+  private InitializeParams createInitializeParams() throws IOException {
+    var version = getVersion();
     return new InitializeParams(
-        new ClientConstantInfoDto("SonarLint CLI", "SonarLint CLI"),
-        new TelemetryClientConstantAttributesDto("sonarLintCli", "SonarLint CLI", "0.0.0", "0.0.0", null),
+        new ClientConstantInfoDto("SonarLint CLI", "java"),
+        new TelemetryClientConstantAttributesDto("sonarLintCli", "SonarLint CLI", version, version, null),
         new HttpConfigurationDto(
             new SslConfigurationDto(null, null, null, null, null, null),
             null,
@@ -67,7 +97,7 @@ public class Main {
             null
         ),
         null,
-        new HashSet<>(Arrays.asList(BackendCapability.values()).stream().filter(c -> !disabledBackendCapabilities.contains(c)).toList()),
+        new HashSet<>(Arrays.stream(BackendCapability.values()).filter(c -> !disabledBackendCapabilities.contains(c)).toList()),
         Path.of(System.getProperty("user.home"), ".sonarlint-cli", "storage"),
         Path.of(System.getProperty("user.home"), ".sonarlint-cli", "work"),
         null,
@@ -76,7 +106,7 @@ public class Main {
         null,
         null,
         List.of(
-            new SonarQubeConnectionConfigurationDto(CONNECTION_ID, configuration.getHost(), true)
+            new SonarQubeConnectionConfigurationDto(CONNECTION_ID, configuration.host(), true)
         ),
         null,
         null,
@@ -95,7 +125,7 @@ public class Main {
         null,
         true,
         CONFIGURATION_SCOPE_ID,
-        new BindingConfigurationDto(CONNECTION_ID, configuration.getProjectKey(), true)
+        new BindingConfigurationDto(CONNECTION_ID, configuration.projectKey(), true)
     );
   }
 
@@ -124,11 +154,11 @@ public class Main {
     }
   }
 
-  private void reportResults(SonarLintCliRpcClient client) {
+  private void reportResults() {
     var rulesRepository = initializer.getInitializedApplicationContext().getBean(RulesRepository.class);
 
     var issues = client.getIssues();
-    var rootPath = Path.of(configuration.getProjectBaseDir());
+    var rootPath = Path.of(configuration.projectBaseDir());
     var ruleSet = new HashSet<String>();
     for (var issueEntry : issues.entrySet()) {
       var fileUri = issueEntry.getKey();
@@ -159,23 +189,6 @@ public class Main {
     }
   }
 
-  private String getProperty(Properties properties, String property) {
-    return properties.getProperty("sonar." + property);
-  }
-
-  private String getAbsolutePathProperty(Properties properties, String property) {
-    var value = getProperty(properties, property);
-    return value == null ? null : Path.of(value).toAbsolutePath().toString();
-  }
-
-  private String[] parseSources(String sources) {
-    return sources == null ? null : Arrays.stream(sources.split(",")).map(String::trim).toArray(String[]::new);
-  }
-
-  private String[] parseExclusions(String exclusions) {
-    return exclusions == null ? null : Arrays.stream(exclusions.split(",")).map(String::trim).map(string -> string.replace("/", File.separator)).toArray(String[]::new);
-  }
-
   /**
    * Reads configuration from given file.
    *
@@ -188,49 +201,51 @@ public class Main {
     } catch (IOException e) {
       throw new SonarLintException("Error when reading configuration file", e);
     }
-    configuration = new Configuration(
-        getProperty(properties, Configuration.Properties.HOST),
-        getProperty(properties, Configuration.Properties.TOKEN),
-        getProperty(properties, Configuration.Properties.PROJECT_KEY),
-        parseSources(getProperty(properties, Configuration.Properties.SOURCES)),
-        getAbsolutePathProperty(properties, Configuration.Properties.PROJECT_BASE_DIR),
-        parseExclusions(getProperty(properties, Configuration.Properties.EXCLUSIONS))
-    );
+    configuration = Configuration.create(properties);
   }
 
+  /**
+   * Gets list of input files to analyze based on configuration. The list is stored in {@link #inputFiles}.
+   */
   private void getInputFiles() {
-    inputFiles = new ArrayList<>();
-    for (String sourcePathString : configuration.getSources()) {
-      var sourcePath = Path.of(configuration.getProjectBaseDir(), sourcePathString);
-      listFiles(sourcePath, sourcePath);
-    }
-  }
+    var storageService = initializer.getInitializedApplicationContext().getBean(StorageService.class);
+    var analyzerStorage = storageService.connection(CONNECTION_ID).project(configuration.projectKey()).analyzerConfiguration();
+    var analyzerConfig = analyzerStorage.read();
+    var settings = new MapSettings(analyzerConfig.getSettings().getAll());
+    exclusionFilters = new ServerFileExclusions(settings.asConfig());
+    exclusionFilters.prepare();
 
-  private boolean isExcluded(Path file) {
-    if (configuration.getExclusions() != null) {
-      var matcher = new AntPathMatcher();
-      for (String exclusion : configuration.getExclusions()) {
-        if (matcher.match(exclusion, file.toString())) {
-          return true;
-        }
+    inputFiles = new ArrayList<>();
+
+    for (var sourcePathString : configuration.sources()) {
+      var sourcePath = Path.of(configuration.projectBaseDir(), sourcePathString);
+      listFiles(sourcePath, sourcePath, Type.MAIN);
+    }
+
+    if (configuration.tests() != null) {
+      for (var testPathString : configuration.tests()) {
+        var testPath = Path.of(configuration.projectBaseDir(), testPathString);
+        listFiles(testPath, testPath, Type.TEST);
       }
     }
-    return false;
+
+    var fsService = initializer.getInitializedApplicationContext().getBean(ClientFileSystemService.class);
+    fsService.didUpdateFileSystem(new DidUpdateFileSystemParams(inputFiles, Collections.emptyList(), Collections.emptyList()));
   }
 
-  private void listFiles(Path path, Path root) {
-    try (var stream = Files.list(path)) {
-      stream.forEach(file -> {
-        if (Files.isDirectory(file)) {
-          listFiles(file, root);
-        } else if (!isExcluded(file)) {
+  private void listFiles(Path rootPath, Path root, InputFile.Type type) {
+    try (var pathStream = Files.list(rootPath)) {
+      pathStream.forEach(path -> {
+        if (Files.isDirectory(path)) {
+          listFiles(path, root, type);
+        } else if (exclusionFilters.accept(root.relativize(path).toString(), type)) {
           inputFiles.add(new ClientFileDto(
-              file.toUri(),
-              root.relativize(file), // get file path relative to root
+              path.toUri(),
+              root.relativize(path),
               CONFIGURATION_SCOPE_ID,
               Boolean.FALSE,
               null,
-              file,
+              path,
               null,
               null,
               true
@@ -242,11 +257,11 @@ public class Main {
     }
   }
 
-  private SonarLintCliRpcClient analyze() {
-    var client = new SonarLintCliRpcClient(configuration.getProjectBaseDir(), inputFiles, configuration.getToken());
+  /**
+   * Connects to SonarQube server and synchronizes configuration.
+   */
+  private void synchronizeConfiguration() throws IOException {
     var params = createInitializeParams();
-    SonarLintLogger.get().setTarget(new SonarLintCliLogOutput(client));
-    SonarLintLogger.get().setLevel(Level.INFO);
     initializer = new SpringApplicationContextInitializer(client, params);
     var configurationService = initializer.getInitializedApplicationContext().getBean(ConfigurationService.class);
     client.resetConfigurationSynchronizationWait();
@@ -254,31 +269,53 @@ public class Main {
     try {
       client.waitForConfigurationSynchronization();
     } catch (InterruptedException e) {
-      throw new cz.pavelzeman.sonarlint.SonarLintException("Error when waiting for synchronization", e);
+      throw new SonarLintException("Error when waiting for synchronization", e);
     }
+  }
+
+  private void analyze() {
     var analysisService = initializer.getInitializedApplicationContext().getBean(AnalysisService.class);
     var analysisId = analysisService.analyzeFullProject(CONFIGURATION_SCOPE_ID, false);
     client.waitForProgress(analysisId.toString());
-    return client;
   }
 
-  private void run(String... args) {
+  /**
+   * Gets name of the JAR file, that this class is running from.
+   * @return JAR file name (during development, it can be also a directory, but when built, it is always a JAR file)
+   */
+  private String getJarName() {
+    var file = new File(getClass().getProtectionDomain().getCodeSource().getLocation().getPath());
+    return file.getName();
+  }
+
+  private void initializeLogging() {
+    var sonarLintLogger = SonarLintLogger.get();
+    sonarLintLogger.setTarget(client);
+    sonarLintLogger.setLevel(configuration.logLevel());
+  }
+
+  private void run(String... args) throws Exception {
     if (args.length != 1) {
-      System.err.println("Usage: java -jar sonarlint-cli.jar <path to sonar-project.properties>");
+      System.err.printf("Usage: java -jar %s <path to sonar-project.properties>", getJarName());
       System.exit(1);
     }
     parseConfiguration(args[0]);
+    client = new SonarLintCliRpcClient(configuration.projectBaseDir(), configuration.token());
+    initializeLogging();
+    synchronizeConfiguration();
     getInputFiles();
-    var client = analyze();
-    reportResults(client);
+    analyze();
+    reportResults();
+    initializer.close();
   }
 
   public static void main(String... args) {
     try {
       new Main().run(args);
-    } catch (Throwable t) {
-      t.printStackTrace();
-      // The engine sometimes keeps running in a separate thread, so we have to force exit here
+    } catch (Exception e) {
+      // We need to catch any exception, so that we can explicitly terminate the application (without termination, the engine keeps running in the background)
+      //noinspection CallToPrintStackTrace we need to print stack trace manually before exiting
+      e.printStackTrace();
       System.exit(1);
     }
     // The engine sometimes keeps running in a separate thread, so we have to force exit here

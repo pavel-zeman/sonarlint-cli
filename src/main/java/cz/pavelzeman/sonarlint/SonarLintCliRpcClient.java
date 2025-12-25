@@ -2,8 +2,10 @@ package cz.pavelzeman.sonarlint;
 
 import java.net.URI;
 import java.nio.file.Path;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -12,9 +14,10 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.slf4j.event.Level;
+import org.sonarsource.sonarlint.core.commons.log.LogOutput;
 import org.sonarsource.sonarlint.core.rpc.protocol.SonarLintRpcClient;
 import org.sonarsource.sonarlint.core.rpc.protocol.client.OpenUrlInBrowserParams;
 import org.sonarsource.sonarlint.core.rpc.protocol.client.analysis.DidChangeAnalysisReadinessParams;
@@ -51,6 +54,7 @@ import org.sonarsource.sonarlint.core.rpc.protocol.client.info.GetClientLiveInfo
 import org.sonarsource.sonarlint.core.rpc.protocol.client.issue.RaiseIssuesParams;
 import org.sonarsource.sonarlint.core.rpc.protocol.client.issue.RaisedFindingDto;
 import org.sonarsource.sonarlint.core.rpc.protocol.client.issue.ShowIssueParams;
+import org.sonarsource.sonarlint.core.rpc.protocol.client.log.LogLevel;
 import org.sonarsource.sonarlint.core.rpc.protocol.client.log.LogParams;
 import org.sonarsource.sonarlint.core.rpc.protocol.client.message.ShowMessageParams;
 import org.sonarsource.sonarlint.core.rpc.protocol.client.message.ShowSoonUnsupportedMessageParams;
@@ -61,13 +65,10 @@ import org.sonarsource.sonarlint.core.rpc.protocol.client.smartnotification.Show
 import org.sonarsource.sonarlint.core.rpc.protocol.client.sync.DidSynchronizeConfigurationScopeParams;
 import org.sonarsource.sonarlint.core.rpc.protocol.client.taint.vulnerability.DidChangeTaintVulnerabilitiesParams;
 import org.sonarsource.sonarlint.core.rpc.protocol.client.telemetry.TelemetryClientLiveAttributesResponse;
-import org.sonarsource.sonarlint.core.rpc.protocol.common.ClientFileDto;
 import org.sonarsource.sonarlint.core.rpc.protocol.common.TokenDto;
 import org.springframework.util.StringUtils;
 
-public class SonarLintCliRpcClient implements SonarLintRpcClient {
-
-  private final List<ClientFileDto> inputFiles;
+public class SonarLintCliRpcClient implements SonarLintRpcClient, LogOutput {
 
   private static final Logger logger = LoggerFactory.getLogger(SonarLintCliRpcClient.class);
 
@@ -81,9 +82,8 @@ public class SonarLintCliRpcClient implements SonarLintRpcClient {
 
   private final String token;
 
-  public SonarLintCliRpcClient(String baseDir, List<ClientFileDto> inputFiles, String token) {
+  public SonarLintCliRpcClient(String baseDir, String token) {
     this.baseDir = baseDir;
-    this.inputFiles = inputFiles;
     this.token = token;
   }
 
@@ -94,12 +94,20 @@ public class SonarLintCliRpcClient implements SonarLintRpcClient {
   @Override
   public void log(LogParams params) {
     var localLogger = LoggerFactory.getLogger(params.getLoggerName());
-    var level = Level.valueOf(params.getLevel().name());
+    var level = org.slf4j.event.Level.valueOf(params.getLevel().name());
     if (localLogger.isEnabledForLevel(level)) {
       var message = StringUtils.hasText(params.getMessage()) ? params.getMessage() : "";
       var stacktrace = StringUtils.hasText(params.getStackTrace()) ? params.getStackTrace() : "";
       localLogger.atLevel(level).setMessage(message + stacktrace).log();
     }
+  }
+
+  /**
+   * Implementation of {@link LogOutput} interface.
+   */
+  @Override
+  public void log(@Nullable String formattedMessage, Level level, @Nullable String stacktrace) {
+    log(new LogParams(LogLevel.valueOf(level.name()), formattedMessage, null, stacktrace, Instant.now()));
   }
 
   @Override
@@ -171,7 +179,8 @@ public class SonarLintCliRpcClient implements SonarLintRpcClient {
 
   @Override
   public CompletableFuture<ListFilesResponse> listFiles(ListFilesParams params) {
-    return getCompletedFuture(new ListFilesResponse(inputFiles));
+    // Return empty list here, we will add the files later
+    return getCompletedFuture(new ListFilesResponse(Collections.emptyList()));
   }
 
   @Override
@@ -283,7 +292,7 @@ public class SonarLintCliRpcClient implements SonarLintRpcClient {
 
   @Override
   public CompletableFuture<CheckServerTrustedResponse> checkServerTrusted(CheckServerTrustedParams params) {
-    throw new UnsupportedOperationException("Not implemented yet");
+    return getCompletedFuture(new CheckServerTrustedResponse(true));
   }
 
   @Override
