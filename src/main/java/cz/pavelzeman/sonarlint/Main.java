@@ -33,7 +33,9 @@ import org.sonarsource.sonarlint.core.rpc.protocol.backend.initialize.Initialize
 import org.sonarsource.sonarlint.core.rpc.protocol.backend.initialize.SslConfigurationDto;
 import org.sonarsource.sonarlint.core.rpc.protocol.backend.initialize.TelemetryClientConstantAttributesDto;
 import org.sonarsource.sonarlint.core.rpc.protocol.backend.log.LogLevel;
+import org.sonarsource.sonarlint.core.rpc.protocol.backend.rules.ImpactDto;
 import org.sonarsource.sonarlint.core.rpc.protocol.common.ClientFileDto;
+import org.sonarsource.sonarlint.core.rpc.protocol.common.ImpactSeverity;
 import org.sonarsource.sonarlint.core.rpc.protocol.common.IssueSeverity;
 import org.sonarsource.sonarlint.core.rpc.protocol.common.Language;
 import org.sonarsource.sonarlint.core.spring.SpringApplicationContextInitializer;
@@ -44,7 +46,6 @@ import org.springframework.util.StringUtils;
 public class Main {
 
   private static final String CONFIGURATION_SCOPE_ID = "sonarLintCliConfigurationScope";
-  private static final String CONNECTION_ID = "sonarLintCliConnection";
 
   /**
    * Configuration read from input properties file.
@@ -102,12 +103,11 @@ public class Main {
         Path.of(System.getProperty("user.home"), ".sonarlint-cli", "work"),
         null,
         null,
-        new HashSet<>(Arrays.asList(Language.values())),
+        // VBNET causes the analysis to fail due to missing Spring bean (this is caused by implementation of SLCORE-1898)
+        new HashSet<>(Arrays.stream(Language.values()).filter(lang -> lang != Language.VBNET).toList()),
         null,
         null,
-        List.of(
-            new SonarQubeConnectionConfigurationDto(CONNECTION_ID, configuration.host(), true)
-        ),
+        List.of(new SonarQubeConnectionConfigurationDto(configuration.host(), configuration.host(), true)),
         null,
         null,
         null,
@@ -125,7 +125,7 @@ public class Main {
         null,
         true,
         CONFIGURATION_SCOPE_ID,
-        new BindingConfigurationDto(CONNECTION_ID, configuration.projectKey(), true)
+        new BindingConfigurationDto(configuration.host(), configuration.projectKey(), true)
     );
   }
 
@@ -142,16 +142,31 @@ public class Main {
     return input;
   }
 
-  private static String getSeverity(IssueSeverity severity) {
-    if (severity == null) {
-      throw new SonarLintException("Unexpected severity");
-    } else {
-      return switch (severity) {
-        case BLOCKER, CRITICAL -> "ERROR";
-        case MAJOR -> "WARNING";
-        case MINOR, INFO -> "WEAK WARNING";
+  private static String getSeverity(IssueSeverity severity, List<ImpactDto> impacts) {
+    if (impacts != null) {
+      // Convert maximum impact severity to issue severity
+      var maxImpactSeverity = ImpactSeverity.INFO;
+      for (var impact : impacts) {
+        if (impact.getImpactSeverity().ordinal() > maxImpactSeverity.ordinal()) {
+          maxImpactSeverity = impact.getImpactSeverity();
+        }
+      }
+      severity = switch (maxImpactSeverity) {
+        case BLOCKER -> IssueSeverity.BLOCKER;
+        case HIGH -> IssueSeverity.CRITICAL;
+        case MEDIUM -> IssueSeverity.MAJOR;
+        case LOW -> IssueSeverity.MINOR;
+        case INFO -> IssueSeverity.INFO;
       };
     }
+    if (severity == null) {
+      throw new SonarLintException("Invalid null issue severity");
+    }
+    return switch (severity) {
+      case BLOCKER, CRITICAL -> "ERROR";
+      case MAJOR -> "WARNING";
+      case MINOR, INFO -> "WEAK WARNING";
+    };
   }
 
   private void reportResults() {
@@ -168,7 +183,7 @@ public class Main {
         var ruleKey = issue.getRuleKey();
         if (!ruleSet.contains(ruleKey)) {
           ruleSet.add(ruleKey);
-          var rule = rulesRepository.getRule(CONNECTION_ID, ruleKey).get();
+          var rule = rulesRepository.getRule(configuration.host(), ruleKey).get();
           System.out.printf("##teamcity[inspectionType id='%s' name='%s' description='%s' category='%s']%n",
               ruleKey,
               escapeStringForTc(ruleKey + " - " + rule.getName()),
@@ -183,7 +198,7 @@ public class Main {
             escapeStringForTc(issue.getPrimaryMessage()),
             relativeFilePath,
             issue.getTextRange() == null ? 0 : issue.getTextRange().getStartLine(),
-            getSeverity(severityMode.isLeft() ? severityMode.getLeft().getSeverity() : null)
+            getSeverity(severityMode.isLeft() ? severityMode.getLeft().getSeverity() : null, severityMode.isRight() ? severityMode.getRight().getImpacts() : null)
         );
       }
     }
@@ -209,7 +224,7 @@ public class Main {
    */
   private void getInputFiles() {
     var storageService = initializer.getInitializedApplicationContext().getBean(StorageService.class);
-    var analyzerStorage = storageService.connection(CONNECTION_ID).project(configuration.projectKey()).analyzerConfiguration();
+    var analyzerStorage = storageService.connection(configuration.host()).project(configuration.projectKey()).analyzerConfiguration();
     var analyzerConfig = analyzerStorage.read();
     var settings = new MapSettings(analyzerConfig.getSettings().getAll());
     exclusionFilters = new ServerFileExclusions(settings.asConfig());
@@ -243,7 +258,7 @@ public class Main {
               path.toUri(),
               root.relativize(path),
               CONFIGURATION_SCOPE_ID,
-              Boolean.FALSE,
+              type == Type.TEST,
               null,
               path,
               null,
