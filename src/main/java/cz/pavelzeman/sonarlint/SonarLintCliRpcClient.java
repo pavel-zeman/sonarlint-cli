@@ -14,6 +14,7 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -68,22 +69,28 @@ import org.sonarsource.sonarlint.core.rpc.protocol.client.telemetry.TelemetryCli
 import org.sonarsource.sonarlint.core.rpc.protocol.common.TokenDto;
 import org.springframework.util.StringUtils;
 
+/**
+ * Implementation of the back-end client.
+ */
 public class SonarLintCliRpcClient implements SonarLintRpcClient, LogOutput {
 
   private static final Logger logger = LoggerFactory.getLogger(SonarLintCliRpcClient.class);
 
-  private CountDownLatch configurationSynchronizationLatch;
+  /** Latch to wait for configuration synchronization. */
+  private final CountDownLatch configurationSynchronizationLatch = new CountDownLatch(1);
 
-  private final Set<String> finishedProgresses = new HashSet<>();
+  /** IDs of finished progress tasks, so that we can wait for them. */
+  private final Set<String> finishedProgressTaskIds = new HashSet<>();
 
+  /** Map of raised issues indexed by file URI. */
   private final Map<URI, Collection<RaisedFindingDto>> issues = new HashMap<>();
 
-  private final String baseDir;
+  private final String projectBaseDir;
 
   private final String token;
 
-  public SonarLintCliRpcClient(String baseDir, String token) {
-    this.baseDir = baseDir;
+  public SonarLintCliRpcClient(String projectBaseDir, String token) {
+    this.projectBaseDir = projectBaseDir;
     this.token = token;
   }
 
@@ -123,22 +130,27 @@ public class SonarLintCliRpcClient implements SonarLintRpcClient, LogOutput {
       var updateNotification = params.getNotification().getLeft();
       logger.info("Progress id {} status {} message {}", params.getTaskId(), updateNotification.getPercentage(), updateNotification.getMessage());
     } else {
-      finishedProgresses.add(params.getTaskId());
+      finishedProgressTaskIds.add(params.getTaskId());
       logger.info("Progress id {} ended", params.getTaskId());
       notify();
     }
   }
 
+  /**
+   * Waits for given progress task to finish.
+   *
+   * @param taskId task ID
+   */
   public synchronized void waitForProgress(String taskId) {
-    while (!finishedProgresses.contains(taskId)) {
+    while (!finishedProgressTaskIds.contains(taskId)) {
       try {
         wait();
       } catch (InterruptedException e) {
         Thread.currentThread().interrupt();
-        throw new RuntimeException("Interrupted while waiting for progress " + taskId, e);
+        throw new SonarLintException("Interrupted while waiting for progress " + taskId, e);
       }
     }
-    finishedProgresses.remove(taskId);
+    finishedProgressTaskIds.remove(taskId);
   }
 
   @Override
@@ -147,23 +159,23 @@ public class SonarLintCliRpcClient implements SonarLintRpcClient, LogOutput {
     configurationSynchronizationLatch.countDown();
   }
 
-  public void resetConfigurationSynchronizationWait() {
-    configurationSynchronizationLatch = new CountDownLatch(1);
-  }
-
+  /**
+   * Waits for configuration synchronization to complete.
+   */
   public void waitForConfigurationSynchronization() throws InterruptedException {
+    // The configuration is synchronized in a separate thread and if it fails, we don't get any notification. As a result, we wait with a timeout here.
     if (!configurationSynchronizationLatch.await(2, TimeUnit.MINUTES)) {
       throw new SonarLintException("Timeout waiting for configuration synchronization");
     }
   }
 
   @Override
-  public CompletableFuture<GetCredentialsResponse> getCredentials(GetCredentialsParams params) {
+  public CompletableFuture<GetCredentialsResponse> getCredentials(@NotNull GetCredentialsParams params) {
     return getCompletedFuture(new GetCredentialsResponse(new TokenDto(token)));
   }
 
   @Override
-  public CompletableFuture<SelectProxiesResponse> selectProxies(SelectProxiesParams params) {
+  public CompletableFuture<SelectProxiesResponse> selectProxies(@NotNull SelectProxiesParams params) {
     return getCompletedFuture(new SelectProxiesResponse(List.of()));
   }
 
@@ -173,12 +185,12 @@ public class SonarLintCliRpcClient implements SonarLintRpcClient, LogOutput {
   }
 
   @Override
-  public CompletableFuture<GetBaseDirResponse> getBaseDir(GetBaseDirParams params) {
-    return getCompletedFuture(new GetBaseDirResponse(Path.of(baseDir)));
+  public CompletableFuture<GetBaseDirResponse> getBaseDir(@NotNull GetBaseDirParams params) {
+    return getCompletedFuture(new GetBaseDirResponse(Path.of(projectBaseDir)));
   }
 
   @Override
-  public CompletableFuture<ListFilesResponse> listFiles(ListFilesParams params) {
+  public CompletableFuture<ListFilesResponse> listFiles(@NotNull ListFilesParams params) {
     // Return empty list here, we will add the files later
     return getCompletedFuture(new ListFilesResponse(Collections.emptyList()));
   }
@@ -189,7 +201,7 @@ public class SonarLintCliRpcClient implements SonarLintRpcClient, LogOutput {
   }
 
   @Override
-  public CompletableFuture<GetInferredAnalysisPropertiesResponse> getInferredAnalysisProperties(GetInferredAnalysisPropertiesParams params) {
+  public CompletableFuture<GetInferredAnalysisPropertiesResponse> getInferredAnalysisProperties(@NotNull GetInferredAnalysisPropertiesParams params) {
     return getCompletedFuture(new GetInferredAnalysisPropertiesResponse(Map.of()));
   }
 
@@ -198,6 +210,7 @@ public class SonarLintCliRpcClient implements SonarLintRpcClient, LogOutput {
     for (var hotspotEntry : params.getHotspotsByFileUri().entrySet()) {
       var fileUri = hotspotEntry.getKey();
       var fileIssues = hotspotEntry.getValue();
+      // Input parameters contain all files regardless of whether there are issues in them or not
       if (!fileIssues.isEmpty()) {
         var existingIssues = issues.computeIfAbsent(fileUri, k -> new ArrayList<>());
         existingIssues.addAll(hotspotEntry.getValue());
@@ -210,6 +223,7 @@ public class SonarLintCliRpcClient implements SonarLintRpcClient, LogOutput {
     for (var issuesEntry : params.getIssuesByFileUri().entrySet()) {
       var fileUri = issuesEntry.getKey();
       var fileIssues = issuesEntry.getValue();
+      // Input parameters contain all files regardless of whether there are issues in them or not
       if (!fileIssues.isEmpty()) {
         var existingIssues = issues.computeIfAbsent(fileUri, k -> new ArrayList<>());
         existingIssues.addAll(fileIssues);
@@ -217,6 +231,12 @@ public class SonarLintCliRpcClient implements SonarLintRpcClient, LogOutput {
     }
   }
 
+  /**
+   * Creates a completed future with given value.
+   *
+   * @param value future value
+   * @return Completed future.
+   */
   private <T> CompletableFuture<T> getCompletedFuture(T value) {
     var result = new CompletableFuture<T>();
     result.complete(value);
@@ -224,103 +244,103 @@ public class SonarLintCliRpcClient implements SonarLintRpcClient, LogOutput {
   }
 
   @Override
-  public void suggestBinding(SuggestBindingParams params) {
-    throw new UnsupportedOperationException("Not implemented yet");
+  public void suggestBinding(@NotNull SuggestBindingParams params) {
+    throw new UnsupportedOperationException();
   }
 
   @Override
-  public void suggestConnection(SuggestConnectionParams params) {
-    throw new UnsupportedOperationException("Not implemented yet");
-
-  }
-
-  @Override
-  public void openUrlInBrowser(OpenUrlInBrowserParams params) {
-    throw new UnsupportedOperationException("Not implemented yet");
+  public void suggestConnection(@NotNull SuggestConnectionParams params) {
+    throw new UnsupportedOperationException();
 
   }
 
   @Override
-  public void showMessage(ShowMessageParams params) {
-    throw new UnsupportedOperationException("Not implemented yet");
+  public void openUrlInBrowser(@NotNull OpenUrlInBrowserParams params) {
+    throw new UnsupportedOperationException();
+
   }
 
   @Override
-  public void showSoonUnsupportedMessage(ShowSoonUnsupportedMessageParams params) {
-    throw new UnsupportedOperationException("Not implemented yet");
+  public void showMessage(@NotNull ShowMessageParams params) {
+    throw new UnsupportedOperationException();
   }
 
   @Override
-  public void showSmartNotification(ShowSmartNotificationParams params) {
-    throw new UnsupportedOperationException("Not implemented yet");
+  public void showSoonUnsupportedMessage(@NotNull ShowSoonUnsupportedMessageParams params) {
+    throw new UnsupportedOperationException();
+  }
+
+  @Override
+  public void showSmartNotification(@NotNull ShowSmartNotificationParams params) {
+    throw new UnsupportedOperationException();
   }
 
   @Override
   public CompletableFuture<GetClientLiveInfoResponse> getClientLiveInfo() {
-    throw new UnsupportedOperationException("Not implemented yet");
+    throw new UnsupportedOperationException();
   }
 
   @Override
-  public void showHotspot(ShowHotspotParams params) {
-    throw new UnsupportedOperationException("Not implemented yet");
+  public void showHotspot(@NotNull ShowHotspotParams params) {
+    throw new UnsupportedOperationException();
   }
 
   @Override
-  public void showIssue(ShowIssueParams params) {
-    throw new UnsupportedOperationException("Not implemented yet");
+  public void showIssue(@NotNull ShowIssueParams params) {
+    throw new UnsupportedOperationException();
   }
 
   @Override
-  public CompletableFuture<AssistCreatingConnectionResponse> assistCreatingConnection(AssistCreatingConnectionParams params) {
-    throw new UnsupportedOperationException("Not implemented yet");
+  public CompletableFuture<AssistCreatingConnectionResponse> assistCreatingConnection(@NotNull AssistCreatingConnectionParams params) {
+    throw new UnsupportedOperationException();
   }
 
   @Override
-  public CompletableFuture<AssistBindingResponse> assistBinding(AssistBindingParams params) {
-    throw new UnsupportedOperationException("Not implemented yet");
+  public CompletableFuture<AssistBindingResponse> assistBinding(@NotNull AssistBindingParams params) {
+    throw new UnsupportedOperationException();
   }
 
   @Override
   public CompletableFuture<TelemetryClientLiveAttributesResponse> getTelemetryLiveAttributes() {
-    throw new UnsupportedOperationException("Not implemented yet");
+    throw new UnsupportedOperationException();
   }
 
   @Override
-  public CompletableFuture<GetProxyPasswordAuthenticationResponse> getProxyPasswordAuthentication(GetProxyPasswordAuthenticationParams params) {
-    throw new UnsupportedOperationException("Not implemented yet");
+  public CompletableFuture<GetProxyPasswordAuthenticationResponse> getProxyPasswordAuthentication(@NotNull GetProxyPasswordAuthenticationParams params) {
+    throw new UnsupportedOperationException();
   }
 
   @Override
-  public CompletableFuture<CheckServerTrustedResponse> checkServerTrusted(CheckServerTrustedParams params) {
+  public CompletableFuture<CheckServerTrustedResponse> checkServerTrusted(@NotNull CheckServerTrustedParams params) {
     return getCompletedFuture(new CheckServerTrustedResponse(true));
   }
 
   @Override
-  public void didReceiveServerHotspotEvent(DidReceiveServerHotspotEvent params) {
-    throw new UnsupportedOperationException("Not implemented yet");
+  public void didReceiveServerHotspotEvent(@NotNull DidReceiveServerHotspotEvent params) {
+    throw new UnsupportedOperationException();
   }
 
   @Override
-  public void didChangeMatchedSonarProjectBranch(DidChangeMatchedSonarProjectBranchParams params) {
-    throw new UnsupportedOperationException("Not implemented yet");
+  public void didChangeMatchedSonarProjectBranch(@NotNull DidChangeMatchedSonarProjectBranchParams params) {
+    throw new UnsupportedOperationException();
   }
   @Override
-  public void didChangeTaintVulnerabilities(DidChangeTaintVulnerabilitiesParams params) {
-    throw new UnsupportedOperationException("Not implemented yet");
-  }
-
-  @Override
-  public void didChangeDependencyRisks(DidChangeDependencyRisksParams params) {
-    throw new UnsupportedOperationException("Not implemented yet");
+  public void didChangeTaintVulnerabilities(@NotNull DidChangeTaintVulnerabilitiesParams params) {
+    throw new UnsupportedOperationException();
   }
 
   @Override
-  public void noBindingSuggestionFound(NoBindingSuggestionFoundParams params) {
-    throw new UnsupportedOperationException("Not implemented yet");
+  public void didChangeDependencyRisks(@NotNull DidChangeDependencyRisksParams params) {
+    throw new UnsupportedOperationException();
   }
 
   @Override
-  public CompletableFuture<GetFileExclusionsResponse> getFileExclusions(GetFileExclusionsParams params) {
-    throw new UnsupportedOperationException("Not implemented yet");
+  public void noBindingSuggestionFound(@NotNull NoBindingSuggestionFoundParams params) {
+    throw new UnsupportedOperationException();
+  }
+
+  @Override
+  public CompletableFuture<GetFileExclusionsResponse> getFileExclusions(@NotNull GetFileExclusionsParams params) {
+    throw new UnsupportedOperationException();
   }
 }

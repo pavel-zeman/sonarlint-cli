@@ -1,5 +1,6 @@
 package cz.pavelzeman.sonarlint;
 
+import cz.pavelzeman.sonarlint.reporter.TeamCity;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
@@ -33,33 +34,30 @@ import org.sonarsource.sonarlint.core.rpc.protocol.backend.initialize.Initialize
 import org.sonarsource.sonarlint.core.rpc.protocol.backend.initialize.SslConfigurationDto;
 import org.sonarsource.sonarlint.core.rpc.protocol.backend.initialize.TelemetryClientConstantAttributesDto;
 import org.sonarsource.sonarlint.core.rpc.protocol.backend.log.LogLevel;
-import org.sonarsource.sonarlint.core.rpc.protocol.backend.rules.ImpactDto;
 import org.sonarsource.sonarlint.core.rpc.protocol.common.ClientFileDto;
-import org.sonarsource.sonarlint.core.rpc.protocol.common.ImpactSeverity;
-import org.sonarsource.sonarlint.core.rpc.protocol.common.IssueSeverity;
 import org.sonarsource.sonarlint.core.rpc.protocol.common.Language;
 import org.sonarsource.sonarlint.core.spring.SpringApplicationContextInitializer;
 import org.sonarsource.sonarlint.core.storage.StorageService;
-import org.springframework.util.StringUtils;
 
 @SuppressWarnings("java:S106") // This is a command line application, so using standard input/output is necessary
 public class Main {
 
+  /** Configuration scope ID used for the analysis. */
   private static final String CONFIGURATION_SCOPE_ID = "sonarLintCliConfigurationScope";
 
-  /**
-   * Configuration read from input properties file.
-   */
+  /** Configuration read from input properties file. */
   private Configuration configuration;
 
   private SpringApplicationContextInitializer initializer;
 
   private SonarLintCliRpcClient client;
 
-  private List<ClientFileDto> inputFiles = new ArrayList<>();
+  private final List<ClientFileDto> inputFiles = new ArrayList<>();
 
+  /** Exclusion filters from server configuration. */
   private ServerFileExclusions exclusionFilters;
 
+  /** Blacklist of backend capabilities. It contains all items, which are not needed for CLI usage. */
   private static final Set<BackendCapability> disabledBackendCapabilities = Set.of(
       BackendCapability.EMBEDDED_SERVER,
       BackendCapability.FLIGHT_RECORDER,
@@ -71,6 +69,11 @@ public class Main {
       BackendCapability.SERVER_SENT_EVENTS
   );
 
+  /**
+   * Returns current version of the tool based on the MANIFEST.MF file.
+   *
+   * @return Current version.
+   */
   private String getVersion() throws IOException {
     var manifestResource = getClass().getResourceAsStream("/META-INF/MANIFEST.MF");
     var version = "unknown";
@@ -85,6 +88,20 @@ public class Main {
     return version;
   }
 
+  /**
+   * Returns root directory used to store SonarLint data.
+   *
+   * @return Sonarlint home.
+   */
+  private Path getSonarLintHome() {
+    return Path.of(System.getProperty("user.home"), ".sonarlint-cli");
+  }
+
+  /**
+   * Creates initialization parameters.
+   *
+   * @return Initialization parameters.
+   */
   private InitializeParams createInitializeParams() throws IOException {
     var version = getVersion();
     return new InitializeParams(
@@ -99,8 +116,8 @@ public class Main {
         ),
         null,
         new HashSet<>(Arrays.stream(BackendCapability.values()).filter(c -> !disabledBackendCapabilities.contains(c)).toList()),
-        Path.of(System.getProperty("user.home"), ".sonarlint-cli", "storage"),
-        Path.of(System.getProperty("user.home"), ".sonarlint-cli", "work"),
+        getSonarLintHome().resolve("storage"),
+        getSonarLintHome().resolve("work"),
         null,
         null,
         // VBNET causes the analysis to fail due to missing Spring bean (this is caused by implementation of SLCORE-1898)
@@ -119,91 +136,6 @@ public class Main {
     );
   }
 
-  private ConfigurationScopeDto getConfigurationScope() {
-    return new ConfigurationScopeDto(
-        CONFIGURATION_SCOPE_ID,
-        null,
-        true,
-        CONFIGURATION_SCOPE_ID,
-        new BindingConfigurationDto(configuration.host(), configuration.projectKey(), true)
-    );
-  }
-
-  public String escapeStringForTc(String input) {
-    if (input == null) {
-      input = "";
-    }
-    input = input.replace("|", "||");
-    input = input.replace("\n", "|n");
-    input = input.replace("\r", "|r");
-    input = input.replace("'", "|'");
-    input = input.replace("[", "|[");
-    input = input.replace("]", "|]");
-    return input;
-  }
-
-  private static String getSeverity(IssueSeverity severity, List<ImpactDto> impacts) {
-    if (impacts != null) {
-      // Convert maximum impact severity to issue severity
-      var maxImpactSeverity = ImpactSeverity.INFO;
-      for (var impact : impacts) {
-        if (impact.getImpactSeverity().ordinal() > maxImpactSeverity.ordinal()) {
-          maxImpactSeverity = impact.getImpactSeverity();
-        }
-      }
-      severity = switch (maxImpactSeverity) {
-        case BLOCKER -> IssueSeverity.BLOCKER;
-        case HIGH -> IssueSeverity.CRITICAL;
-        case MEDIUM -> IssueSeverity.MAJOR;
-        case LOW -> IssueSeverity.MINOR;
-        case INFO -> IssueSeverity.INFO;
-      };
-    }
-    if (severity == null) {
-      throw new SonarLintException("Invalid null issue severity");
-    }
-    return switch (severity) {
-      case BLOCKER, CRITICAL -> "ERROR";
-      case MAJOR -> "WARNING";
-      case MINOR, INFO -> "WEAK WARNING";
-    };
-  }
-
-  private void reportResults() {
-    var rulesRepository = initializer.getInitializedApplicationContext().getBean(RulesRepository.class);
-
-    var issues = client.getIssues();
-    var rootPath = Path.of(configuration.projectBaseDir());
-    var ruleSet = new HashSet<String>();
-    for (var issueEntry : issues.entrySet()) {
-      var fileUri = issueEntry.getKey();
-      var absoluteFilePath = Path.of(fileUri);
-      var relativeFilePath = rootPath.relativize(absoluteFilePath);
-      for (var issue : issueEntry.getValue()) {
-        var ruleKey = issue.getRuleKey();
-        if (!ruleSet.contains(ruleKey)) {
-          ruleSet.add(ruleKey);
-          var rule = rulesRepository.getRule(configuration.host(), ruleKey).get();
-          System.out.printf("##teamcity[inspectionType id='%s' name='%s' description='%s' category='%s']%n",
-              ruleKey,
-              escapeStringForTc(ruleKey + " - " + rule.getName()),
-              // Description is mandatory, so use name as description, if name is not available
-              escapeStringForTc(StringUtils.hasText(rule.getHtmlDescription()) ? rule.getHtmlDescription() : rule.getName()),
-              rule.getType().name()
-          );
-        }
-        var severityMode = issue.getSeverityMode();
-        System.out.printf("##teamcity[inspection typeId='%s' message='%s' file='%s' line='%d' severity='%s']%n",
-            ruleKey,
-            escapeStringForTc(issue.getPrimaryMessage()),
-            relativeFilePath,
-            issue.getTextRange() == null ? 0 : issue.getTextRange().getStartLine(),
-            getSeverity(severityMode.isLeft() ? severityMode.getLeft().getSeverity() : null, severityMode.isRight() ? severityMode.getRight().getImpacts() : null)
-        );
-      }
-    }
-  }
-
   /**
    * Reads configuration from given file.
    *
@@ -220,17 +152,23 @@ public class Main {
   }
 
   /**
-   * Gets list of input files to analyze based on configuration. The list is stored in {@link #inputFiles}.
+   * Prepares exclusion filters based on server configuration.
    */
-  private void getInputFiles() {
+  private void prepareExclusionFilters() {
     var storageService = initializer.getInitializedApplicationContext().getBean(StorageService.class);
     var analyzerStorage = storageService.connection(configuration.host()).project(configuration.projectKey()).analyzerConfiguration();
     var analyzerConfig = analyzerStorage.read();
     var settings = new MapSettings(analyzerConfig.getSettings().getAll());
     exclusionFilters = new ServerFileExclusions(settings.asConfig());
     exclusionFilters.prepare();
+  }
 
-    inputFiles = new ArrayList<>();
+  /**
+   * Gets list of input files to analyze based on configuration. The list is stored to {@link #inputFiles}.
+   * This has to be run after project synchronization, because it uses exclusion filters from project configuration.
+   */
+  private void getInputFiles() {
+    prepareExclusionFilters();
 
     for (var sourcePathString : configuration.sources()) {
       var sourcePath = Path.of(configuration.projectBaseDir(), sourcePathString);
@@ -244,12 +182,20 @@ public class Main {
       }
     }
 
+    // Generate event, so that the analysis engine knows about the input files
     var fsService = initializer.getInitializedApplicationContext().getBean(ClientFileSystemService.class);
     fsService.didUpdateFileSystem(new DidUpdateFileSystemParams(inputFiles, Collections.emptyList(), Collections.emptyList()));
   }
 
-  private void listFiles(Path rootPath, Path root, InputFile.Type type) {
-    try (var pathStream = Files.list(rootPath)) {
+  /**
+   * Lists all files in given root path recursively and adds them to {@link #inputFiles}, if they are accepted by exclusion filters.
+   *
+   * @param currentPath current directory
+   * @param root root directory used to relativize file paths
+   * @param type file type (source or test)
+   */
+  private void listFiles(Path currentPath, Path root, InputFile.Type type) {
+    try (var pathStream = Files.list(currentPath)) {
       pathStream.forEach(path -> {
         if (Files.isDirectory(path)) {
           listFiles(path, root, type);
@@ -275,19 +221,25 @@ public class Main {
   /**
    * Connects to SonarQube server and synchronizes configuration.
    */
-  private void synchronizeConfiguration() throws IOException {
+  private void synchronizeConfiguration() throws IOException, InterruptedException {
     var params = createInitializeParams();
     initializer = new SpringApplicationContextInitializer(client, params);
     var configurationService = initializer.getInitializedApplicationContext().getBean(ConfigurationService.class);
-    client.resetConfigurationSynchronizationWait();
-    configurationService.didAddConfigurationScopes(List.of(getConfigurationScope()));
-    try {
-      client.waitForConfigurationSynchronization();
-    } catch (InterruptedException e) {
-      throw new SonarLintException("Error when waiting for synchronization", e);
-    }
+    var configurationScope = new ConfigurationScopeDto(
+        CONFIGURATION_SCOPE_ID,
+        null,
+        true,
+        CONFIGURATION_SCOPE_ID,
+        new BindingConfigurationDto(configuration.host(), configuration.projectKey(), true)
+    );
+    // Generate configuration add event to start synchronization
+    configurationService.didAddConfigurationScopes(List.of(configurationScope));
+    client.waitForConfigurationSynchronization();
   }
 
+  /**
+   * Runs project analysis.
+   */
   private void analyze() {
     var analysisService = initializer.getInitializedApplicationContext().getBean(AnalysisService.class);
     var analysisId = analysisService.analyzeFullProject(CONFIGURATION_SCOPE_ID, false);
@@ -303,6 +255,9 @@ public class Main {
     return file.getName();
   }
 
+  /**
+   * Initializes Sonarlint logging based on the configured log level.
+   */
   private void initializeLogging() {
     var sonarLintLogger = SonarLintLogger.get();
     sonarLintLogger.setTarget(client);
@@ -320,7 +275,7 @@ public class Main {
     synchronizeConfiguration();
     getInputFiles();
     analyze();
-    reportResults();
+    new TeamCity(initializer.getInitializedApplicationContext().getBean(RulesRepository.class), configuration).reportIssues(client.getIssues());
     initializer.close();
   }
 

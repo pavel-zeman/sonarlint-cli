@@ -9,4 +9,6 @@
   <root level="info">
     <appender-ref ref="STDOUT" />
   </root>
+  <!-- Sonarlint log level is set in configuration, so we have to set minimum log level here -->
+  <logger name="sonarlint" level="all"/>
 </configuration>
