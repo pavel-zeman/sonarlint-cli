@@ -70,7 +70,7 @@ import org.sonarsource.sonarlint.core.rpc.protocol.common.TokenDto;
 import org.springframework.util.StringUtils;
 
 /**
- * Implementation of the back-end client.
+ * Implementation of the back-end client. Only methods needed by CLI are implemented.
  */
 public class SonarLintCliRpcClient implements SonarLintRpcClient, LogOutput {
 
