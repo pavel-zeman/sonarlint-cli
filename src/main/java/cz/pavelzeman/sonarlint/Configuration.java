@@ -5,6 +5,7 @@ import java.nio.file.Paths;
 import java.util.Arrays;
 import java.util.Properties;
 import org.sonarsource.sonarlint.core.commons.log.LogOutput.Level;
+import org.springframework.util.StringUtils;
 
 /**
  * Configuration properties. For more information about each property, see
@@ -95,6 +96,9 @@ public record Configuration(String host, String token, String organization, Stri
       value = System.getenv(propertyKeyToEnvironmentVariable(key));
       if (value == null) {
         value = properties.getProperty(key);
+        if (!StringUtils.hasText(value)) {
+          value = null;
+        }
       }
     }
     if (required && value == null) {
@@ -108,7 +112,7 @@ public record Configuration(String host, String token, String organization, Stri
   }
 
   private static String[] parseSources(String sources) {
-    return sources == null || sources.trim().isEmpty() ? null : Arrays.stream(sources.split(",")).map(String::trim).toArray(String[]::new);
+    return sources == null ? null : Arrays.stream(sources.split(",")).map(String::trim).toArray(String[]::new);
   }
 
   /**
