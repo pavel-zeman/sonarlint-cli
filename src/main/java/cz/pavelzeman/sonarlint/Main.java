@@ -25,6 +25,7 @@ import org.sonarsource.sonarlint.core.plugin.commons.sonarapi.MapSettings;
 import org.sonarsource.sonarlint.core.repository.rules.RulesRepository;
 import org.sonarsource.sonarlint.core.rpc.protocol.backend.config.binding.BindingConfigurationDto;
 import org.sonarsource.sonarlint.core.rpc.protocol.backend.config.scope.ConfigurationScopeDto;
+import org.sonarsource.sonarlint.core.rpc.protocol.backend.connection.config.SonarCloudConnectionConfigurationDto;
 import org.sonarsource.sonarlint.core.rpc.protocol.backend.connection.config.SonarQubeConnectionConfigurationDto;
 import org.sonarsource.sonarlint.core.rpc.protocol.backend.file.DidUpdateFileSystemParams;
 import org.sonarsource.sonarlint.core.rpc.protocol.backend.initialize.BackendCapability;
@@ -36,6 +37,7 @@ import org.sonarsource.sonarlint.core.rpc.protocol.backend.initialize.TelemetryC
 import org.sonarsource.sonarlint.core.rpc.protocol.backend.log.LogLevel;
 import org.sonarsource.sonarlint.core.rpc.protocol.common.ClientFileDto;
 import org.sonarsource.sonarlint.core.rpc.protocol.common.Language;
+import org.sonarsource.sonarlint.core.rpc.protocol.common.SonarCloudRegion;
 import org.sonarsource.sonarlint.core.spring.SpringApplicationContextInitializer;
 import org.sonarsource.sonarlint.core.storage.StorageService;
 
@@ -98,12 +100,37 @@ public class Main {
   }
 
   /**
+   * Gets SonarCloud region based on the configured host URL. The logic considers just URL prefixes.
+   *
+   * @return SonarCloud region. If there is no region found, it throws an exception.
+   */
+  private SonarCloudRegion getSonarCloudRegion() {
+    for (var region: org.sonarsource.sonarlint.core.SonarCloudRegion.values()) {
+      if (configuration.host().startsWith(region.getProductionUri().toString())) {
+        return SonarCloudRegion.valueOf(region.name());
+      }
+    }
+    throw new SonarLintException("Invalid SonarCloud host URL: " + configuration.host());
+  }
+
+  /**
+   * Returns connection ID. Currently, it is the same as the host URL.
+   *
+   * @return Connection ID.
+   */
+  private String getConnectionId() {
+    return configuration.host();
+  }
+
+  /**
    * Creates initialization parameters.
    *
    * @return Initialization parameters.
    */
   private InitializeParams createInitializeParams() throws IOException {
     var version = getVersion();
+    var sonarQubeConnection = configuration.organization() == null ? new SonarQubeConnectionConfigurationDto(getConnectionId(), configuration.host(), true) : null;
+    var sonarCloudConnection = configuration.organization() == null ? null : new SonarCloudConnectionConfigurationDto(getConnectionId(), configuration.organization(), getSonarCloudRegion(), true);
     return new InitializeParams(
         new ClientConstantInfoDto("SonarLint CLI", "java"),
         new TelemetryClientConstantAttributesDto("sonarLintCli", "SonarLint CLI", version, version, null),
@@ -124,8 +151,8 @@ public class Main {
         new HashSet<>(Arrays.stream(Language.values()).filter(lang -> lang != Language.VBNET).toList()),
         null,
         null,
-        List.of(new SonarQubeConnectionConfigurationDto(configuration.host(), configuration.host(), true)),
-        null,
+        sonarQubeConnection == null ? null : List.of(sonarQubeConnection),
+        sonarCloudConnection == null ? null : List.of(sonarCloudConnection),
         null,
         null,
         false,
@@ -156,7 +183,7 @@ public class Main {
    */
   private void prepareExclusionFilters() {
     var storageService = initializer.getInitializedApplicationContext().getBean(StorageService.class);
-    var analyzerStorage = storageService.connection(configuration.host()).project(configuration.projectKey()).analyzerConfiguration();
+    var analyzerStorage = storageService.connection(getConnectionId()).project(configuration.projectKey()).analyzerConfiguration();
     var analyzerConfig = analyzerStorage.read();
     var settings = new MapSettings(analyzerConfig.getSettings().getAll());
     exclusionFilters = new ServerFileExclusions(settings.asConfig());
@@ -230,7 +257,7 @@ public class Main {
         null,
         true,
         CONFIGURATION_SCOPE_ID,
-        new BindingConfigurationDto(configuration.host(), configuration.projectKey(), true)
+        new BindingConfigurationDto(getConnectionId(), configuration.projectKey(), true)
     );
     // Generate configuration add event to start synchronization
     configurationService.didAddConfigurationScopes(List.of(configurationScope));

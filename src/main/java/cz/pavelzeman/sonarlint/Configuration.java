@@ -12,6 +12,7 @@ import org.sonarsource.sonarlint.core.commons.log.LogOutput.Level;
  *
  * @param host SonarQube server URL
  * @param token authentication token
+ * @param organization organization key (for SonarCloud only)
  * @param projectKey project key
  * @param sources directories with source files
  * @param tests directories with test files
@@ -19,7 +20,7 @@ import org.sonarsource.sonarlint.core.commons.log.LogOutput.Level;
  * @param logLevel log level
  */
 @SuppressWarnings("java:S6218") // No need to override equals and hashCode, because this is just a "POJO" and is not used in any hash-like structures
-public record Configuration(String host, String token, String projectKey, String[] sources, String[] tests, String projectBaseDir, Level logLevel) {
+public record Configuration(String host, String token, String organization, String projectKey, String[] sources, String[] tests, String projectBaseDir, Level logLevel) {
 
   /**
    * Creates configuration object from given properties.
@@ -46,6 +47,7 @@ public record Configuration(String host, String token, String projectKey, String
     return new Configuration(
         getProperty(properties, PropertyNames.HOST, true),
         getProperty(properties, PropertyNames.TOKEN, true),
+        getProperty(properties, PropertyNames.ORGANIZATION, false),
         getProperty(properties, PropertyNames.PROJECT_KEY, true),
         sourceDirs,
         parseSources(getProperty(properties, PropertyNames.TESTS, false)),
@@ -121,5 +123,6 @@ public record Configuration(String host, String token, String projectKey, String
     public static final String TESTS = "tests";
     public static final String PROJECT_BASE_DIR = "projectBaseDir";
     public static final String LOG_LEVEL = "log.level";
+    public static final String ORGANIZATION = "organization";
   }
 }
